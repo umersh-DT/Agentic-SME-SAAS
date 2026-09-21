@@ -1,0 +1,30 @@
+﻿# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment Variables & Secrets
+.env
+*.env
+*.pem
+*.key
+
+# Tenant Data & SQLite DBs (Strict isolation)
+data/tenants/*.db
+data/tenants/*.sqlite
+!data/tenants/.gitkeep
+
+# Docker & Logs
+*.log
+docker-compose.override.yml
+
+# Testing & IDE
+.pytest_cache/
+.coverage
+.vscode/
+.idea/
