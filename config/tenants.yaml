@@ -1,0 +1,46 @@
+tenants:
+  - id: "tenant_curtains_001"
+    business_name: "Luxe Curtain Interiors"
+    owner_name: "Tariq Mansoor"
+    whatsapp_number: "+971501234567"
+    active_plan: "pro"
+    status: "active"
+    website_url: "https://luxecurtains.example.com"
+    target_keywords:
+      - "custom curtains dubai"
+      - "motorized blackout shades"
+    enabled_skills:
+      - "calendar_sync"
+      - "invoicing"
+      - "research"
+      - "memory_tree"
+      - "seo_manager"
+
+  - id: "tenant_photo_002"
+    business_name: "Apex Frame Photography"
+    owner_name: "Sarah Jenkins"
+    whatsapp_number: "+971509876543"
+    active_plan: "starter"
+    status: "active"
+    website_url: "https://apexphoto.example.com"
+    target_keywords:
+      - "dubai wedding photographer"
+    enabled_skills:
+      - "calendar_sync"
+      - "research"
+      - "memory_tree"
+
+  - id: "tenant_clean_003"
+    business_name: "PureSpace Cleaning"
+    owner_name: "Dawit Bekele"
+    whatsapp_number: "+251911234567"
+    active_plan: "pro"
+    status: "active"
+    website_url: "https://purespaceclean.example.com"
+    target_keywords:
+      - "home deep cleaning addis ababa"
+    enabled_skills:
+      - "calendar_sync"
+      - "invoicing"
+      - "memory_tree"
+      - "seo_manager"
