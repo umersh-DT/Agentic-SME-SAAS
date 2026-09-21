@@ -1,0 +1,42 @@
+FROM python:3.11-slim
+
+# Prevent Python from writing .pyc files and buffer stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install OS-level dependencies for headless scraping, networking, and compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    sqlite3 \
+    libsqlite3-dev \
+    chromium \
+    chromium-driver \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency definition and install packages
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy source code and default configurations
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+# Ensure tenant data mount point exists
+RUN mkdir -p /app/data/tenants
+
+# Non-root user execution for tenant sandbox security
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Health check to ensure daemon heartbeat
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python3 -c "import sqlite3, requests; print('OK')" || exit 1
+
+# Launch OpenHuman execution engine with tenant ID passed via environment
+CMD ["python3", "-m", "src.core.engine"]

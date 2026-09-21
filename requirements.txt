@@ -1,0 +1,28 @@
+# OpenHuman Agent Core & Async Framework
+openhuman>=0.2.1
+pydantic>=2.7.0
+pydantic-settings>=2.2.1
+asyncio>=3.4.3
+aiohttp>=3.9.5
+
+# Webhook Gateway & API Routing
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+requests>=2.32.3
+httpx>=0.27.0
+
+# Database & Memory Persistence
+aiosqlite>=0.20.0
+
+# Pre-bundled Skills Utilities
+reportlab>=4.2.0
+google-api-python-client>=2.130.0
+google-auth-oauthlib>=1.2.0
+stripe>=9.5.0
+beautifulsoup4>=4.12.3
+selenium>=4.21.0
+
+# Observability & Configuration
+pyyaml>=6.0.1
+python-dotenv>=1.0.1
+structlog>=24.2.0
