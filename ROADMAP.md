@@ -14,20 +14,20 @@
 
 ---
 
-## Phase 2: OpenHuman Core & Pre-Bundled Skills (ACTIVE)
-- [ ] Implement SQLite Persistent Memory Tree (`src/skills/memory_tree.py`) with FTS5 search and hierarchical nodes
-- [ ] Build OpenHuman context extractor to parse incoming WhatsApp rules and populate memory nodes
-- [ ] Implement Google Calendar scheduling skill module (`src/skills/calendar_sync.py`)
-- [ ] Implement automated invoice and estimate drafting skill module (`src/skills/invoicing.py`)
-- [ ] Implement deep-search & competitor research skill module (`src/skills/research.py`)
-- [ ] Implement automated Weekly SEO Management skill module (`src/skills/seo_manager.py`)
-- [ ] Build end-to-end integration test suite simulating multi-tenant message flows and tool execution
+## Phase 2: OpenHuman Core & Pre-Bundled Skills (COMPLETED)
+- [x] Implement SQLite Persistent Memory Tree (`src/skills/memory_tree.py`) with FTS5 search and hierarchical nodes
+- [x] Build OpenHuman context extractor to parse incoming WhatsApp rules and populate memory nodes (`src/core/context_extractor.py`)
+- [x] Implement Google Calendar scheduling skill module (`src/skills/calendar_sync.py`)
+- [x] Implement automated invoice and estimate drafting skill module (`src/skills/invoicing.py`)
+- [x] Implement deep-search & competitor research skill module (`src/skills/research.py`)
+- [x] Implement automated Weekly SEO Management skill module (`src/skills/seo_manager.py`)
+- [x] Build end-to-end integration test suite simulating multi-tenant message flows and tool execution (`tests/test_phase2_suite.py`)
 
 ---
 
-## Phase 3: WhatsApp Gateway, Twilio & Stripe Billing
-- [ ] Twilio WhatsApp Business API Webhook integration
-- [ ] Tenant signature authentication & message rate-limiting
+## Phase 3: WhatsApp Gateway, Twilio & Stripe Billing (ACTIVE)
+- [ ] Twilio WhatsApp Business API Webhook integration in `src/gateway/`
+- [ ] Tenant signature authentication, idempotency, and message rate-limiting
 - [ ] Stripe customer portal & recurring subscription billing integration
 - [ ] Automated tenant provisioning and volume mount setup upon subscription checkout
 
