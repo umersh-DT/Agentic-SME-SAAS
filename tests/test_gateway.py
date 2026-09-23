@@ -1,3 +1,5 @@
+import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -8,6 +10,8 @@ from fastapi.testclient import TestClient
 from src.gateway.main import app
 from src.gateway.twilio_webhook import dedup_cache, verify_twilio_signature
 from src.gateway.stripe_billing import verify_stripe_signature
+from src.gateway.dispatcher import dispatcher
+from src.skills.memory_tree import TenantMemoryTree
 
 
 class TestGatewayWebhook(unittest.TestCase):
@@ -32,10 +36,9 @@ class TestGatewayWebhook(unittest.TestCase):
             "Body": "What is the price for living room curtains?",
         }
 
-        # Generate valid HMAC-SHA1 signature
+        # Generate expected HMAC-SHA1 signature
         sorted_keys = sorted(params.keys())
         sig_payload = url + "".join(f"{k}{params[k]}" for k in sorted_keys)
-        import base64
         valid_sig = base64.b64encode(
             hmac.new(token.encode("utf-8"), sig_payload.encode("utf-8"), hashlib.sha1).digest()
         ).decode("utf-8")
@@ -65,7 +68,7 @@ class TestGatewayWebhook(unittest.TestCase):
             "Body": "Checking idempotency",
         }
 
-        # First dispatch
+        # First request
         res1 = self.client.post("/webhook/whatsapp", data=payload)
         self.assertEqual(res1.status_code, 200)
 
@@ -85,7 +88,6 @@ class TestGatewayWebhook(unittest.TestCase):
 
         self.assertTrue(verify_stripe_signature(raw_body, valid_header, secret))
         self.assertFalse(verify_stripe_signature(raw_body, f"t={t},v1=bad_sig", secret))
-        # Verify timestamp drift outside 300s window is rejected
         self.assertFalse(verify_stripe_signature(raw_body, f"t={t - 400},v1={v1_sig}", secret))
 
     def test_stripe_webhook_checkout_completed(self):
@@ -107,6 +109,39 @@ class TestGatewayWebhook(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["status"], "success")
         self.assertEqual(data["event_type"], "checkout.session.completed")
+
+    def test_dispatcher_background_execution_pipeline(self):
+        tenant_id = "tenant_test_pipeline_001"
+        test_sid = "SM_async_dispatch_test_887766"
+        message_body = "From now on, all orders over 1000 AED require a 50% non-refundable deposit."
+
+        # Execute async worker pipeline
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(
+            dispatcher.process_incoming_message(
+                tenant_id=tenant_id,
+                from_number="+971501234567",
+                body=message_body,
+                message_sid=test_sid,
+            )
+        )
+        loop.close()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["tenant_id"], tenant_id)
+        self.assertEqual(result["rules_extracted"], 1)
+
+        # Confirm the rule is persisted and indexed in the tenant's SQLite FTS5 database
+        verify_loop = asyncio.new_event_loop()
+        memory = TenantMemoryTree(tenant_id=tenant_id, base_data_dir=dispatcher.data_root)
+        search_results = verify_loop.run_until_complete(
+            memory.search_memory(query="deposit", limit=5)
+        )
+        verify_loop.close()
+
+        self.assertGreater(len(search_results), 0)
+        self.assertIn("50%", search_results[0]["content"])
 
 
 if __name__ == "__main__":
