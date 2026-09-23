@@ -25,15 +25,16 @@
 
 ---
 
-## Phase 3: WhatsApp Gateway, Twilio & Stripe Billing (ACTIVE)
-- [ ] Twilio WhatsApp Business API Webhook integration in `src/gateway/`
-- [ ] Tenant signature authentication, idempotency, and message rate-limiting
-- [ ] Stripe customer portal & recurring subscription billing integration
-- [ ] Automated tenant provisioning and volume mount setup upon subscription checkout
+## Phase 3: WhatsApp Gateway, Twilio & Stripe Billing (COMPLETED)
+- [x] Twilio WhatsApp Business API Webhook integration in `src/gateway/`
+- [x] Tenant signature authentication, idempotency, and message rate-limiting
+- [x] Stripe customer portal & recurring subscription billing integration
+- [x] Automated tenant provisioning and volume mount setup upon subscription checkout
 
 ---
 
-## Phase 4: Production Hardening, Monitoring & Launch
+## Phase 4: Production Hardening, Monitoring & Launch (ACTIVE)
+- [ ] Outbound WhatsApp reply skill module via Twilio REST API
 - [ ] Automated daily backup daemon for tenant SQLite databases to S3/Cloud Storage
 - [ ] Prometheus metrics and Grafana observability dashboard
 - [ ] Domain configuration, Nginx reverse proxy, and Let's Encrypt SSL automation
