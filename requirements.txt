@@ -26,3 +26,10 @@ selenium>=4.21.0
 pyyaml>=6.0.1
 python-dotenv>=1.0.1
 structlog>=24.2.0
+
+
+
+
+stripe>=8.0.0
+aiosqlite>=0.20.0
+python-multipart>=0.0.9
