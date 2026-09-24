@@ -7,7 +7,7 @@ import time
 from typing import Dict, List, Optional
 from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Form, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 import yaml
 
 logger = logging.getLogger("gateway_twilio")
@@ -72,12 +72,10 @@ class TenantDirectory:
         tenant_iterable = tenants.values() if isinstance(tenants, dict) else tenants
 
         for t in tenant_iterable:
-            # Check both 'id' and 'tenant_id'
             tenant_id = t.get("id") or t.get("tenant_id")
             if not tenant_id:
                 continue
 
-            # Check all possible registered phone numbers for the tenant
             candidate_phones: List[str] = []
             if t.get("owner_phone"):
                 candidate_phones.append(t.get("owner_phone"))
@@ -114,7 +112,7 @@ def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_tok
     """Validates the X-Twilio-Signature HMAC-SHA1 header against post params."""
     if not auth_token:
         return False
-    data_dict = dict(parse_qsl(post_data.decode("utf-8", errors="ignore")))
+    data_dict = dict(parse_qsl(post_data.decode("utf-8", errors="ignore"), keep_blank_values=True))
     concatenated = url + "".join(f"{k}{v}" for k, v in sorted(data_dict.items()))
     computed = base64.b64encode(
         hmac.new(auth_token.encode("utf-8"), concatenated.encode("utf-8"), hashlib.sha1).digest()
@@ -125,10 +123,6 @@ def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_tok
 @router.post("/whatsapp")
 async def handle_whatsapp_webhook(
     request: Request,
-    From: str = Form(...),
-    To: str = Form(...),
-    Body: str = Form(""),
-    MessageSid: str = Form(...),
     x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
 ):
     """Twilio WhatsApp Inbound Webhook handler."""
@@ -139,23 +133,33 @@ async def handle_whatsapp_webhook(
         logger.error("[SECURITY] TWILIO_AUTH_TOKEN is unset. Rejecting webhook (fail-closed).")
         raise HTTPException(status_code=403, detail="Webhook authentication is unconfigured.")
 
-    # Validate HMAC signature
+    # Read raw body directly without Form(...) consuming the stream
     raw_body = await request.body()
     effective_url = str(request.url)
+
     if not x_twilio_signature or not verify_twilio_signature(effective_url, raw_body, x_twilio_signature, auth_token):
         logger.warning(f"[SECURITY] Invalid Twilio signature from {request.client.host if request.client else 'unknown'}")
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
+    # Parse form parameters with empty value preservation
+    form_params = dict(parse_qsl(raw_body.decode("utf-8", errors="ignore"), keep_blank_values=True))
+    from_number = form_params.get("From", "")
+    message_sid = form_params.get("MessageSid", "")
+
+    if not message_sid:
+        logger.warning("[GATEWAY] Missing MessageSid in valid webhook payload.")
+        return Response(content="<Response></Response>", media_type="application/xml")
+
     # Deduplication check
-    if dedup_cache.is_duplicate(MessageSid):
-        logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={MessageSid}")
+    if dedup_cache.is_duplicate(message_sid):
+        logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
         return Response(content="<Response></Response>", media_type="application/xml")
 
     # Resolve tenant strictly by sender (From)
-    tenant_id = tenant_directory.resolve_sender(From)
+    tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
-        logger.warning(f"[ROUTING REJECT] Unregistered sender: {From}. Discarding message without tenant data access.")
+        logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}. Discarding message without tenant data access.")
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    logger.info(f"[INGRESS ACCEPTED] MessageSid={MessageSid} | Tenant={tenant_id} | Sender={From}")
+    logger.info(f"[INGRESS ACCEPTED] MessageSid={message_sid} | Tenant={tenant_id} | Sender={from_number}")
     return Response(content="<Response></Response>", media_type="application/xml")
