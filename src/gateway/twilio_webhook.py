@@ -4,21 +4,19 @@ import hmac
 import logging
 import os
 import time
-from pathlib import Path
-from typing import Dict, Optional, Set
-import yaml
-from fastapi import APIRouter, Form, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from typing import Dict, List, Optional
+from urllib.parse import parse_qsl
 
-logger = logging.getLogger("twilio_gateway")
-router = APIRouter(prefix="/webhook", tags=["Twilio WhatsApp"])
+from fastapi import APIRouter, Form, Header, HTTPException, Request, Response
+import yaml
+
+logger = logging.getLogger("gateway_twilio")
+
+router = APIRouter(prefix="/webhook", tags=["Twilio Ingress"])
 
 
 class DeduplicationCache:
-    """Sliding-window in-memory deduplicator for Twilio MessageSid payloads.
-
-    Maintains processed MessageSids with a 10-minute TTL to block retry loops.
-    """
+    """In-memory sliding-window cache to drop duplicate Twilio MessageSids."""
 
     def __init__(self, ttl_seconds: int = 600):
         self.ttl = ttl_seconds
@@ -26,123 +24,138 @@ class DeduplicationCache:
 
     def is_duplicate(self, message_sid: str) -> bool:
         now = time.time()
-        # Clean expired entries
-        self._cache = {sid: ts for sid, ts in self._cache.items() if now - ts < self.ttl}
+        self._purge_expired(now)
         if message_sid in self._cache:
             return True
         self._cache[message_sid] = now
         return False
+
+    def _purge_expired(self, current_time: float) -> None:
+        expired = [sid for sid, timestamp in self._cache.items() if current_time - timestamp > self.ttl]
+        for sid in expired:
+            del self._cache[sid]
 
 
 dedup_cache = DeduplicationCache()
 
 
 class TenantDirectory:
-    """Loads and matches tenant metadata from config/tenants.yaml by WhatsApp phone number."""
+    """Loads tenant registry and resolves incoming sender phone numbers to tenant IDs."""
 
-    def __init__(self, config_path: str = "/app/config/tenants.yaml"):
+    def __init__(self, config_path: str = "config/tenants.yaml"):
         self.config_path = config_path
-        self._phone_to_tenant: Dict[str, str] = {}
-        self.reload()
+        self.phone_to_tenant: Dict[str, str] = {}
+        self.reload_tenants()
 
-    def reload(self):
-        path = Path(self.config_path)
-        if not path.exists():
-            # Fallback for local testing if running outside /app
-            path = Path("config/tenants.yaml")
+    @staticmethod
+    def normalize_phone(phone: Optional[str]) -> str:
+        """Strips whatsapp: prefixes, spaces, and hyphens to normalize to standard E.164."""
+        if not phone:
+            return ""
+        cleaned = phone.strip()
+        if cleaned.startswith("whatsapp:"):
+            cleaned = cleaned.replace("whatsapp:", "")
+        return cleaned.replace(" ", "").replace("-", "").strip()
 
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-                tenants = data.get("tenants", [])
-                for t in tenants:
-                    tid = t.get("tenant_id")
-                    phone = str(t.get("whatsapp_number", "")).replace("whatsapp:", "").strip()
-                    if phone and tid:
-                        self._phone_to_tenant[phone] = tid
-                        # Also register stripped '+' variant
-                        self._phone_to_tenant[phone.lstrip("+")] = tid
+    def reload_tenants(self) -> None:
+        if not os.path.exists(self.config_path):
+            logger.warning(f"Tenant configuration file not found at: {self.config_path}")
+            return
 
-    def resolve_tenant(self, to_number: str, from_number: str) -> Optional[str]:
-        clean_to = to_number.replace("whatsapp:", "").strip()
-        clean_from = from_number.replace("whatsapp:", "").strip()
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
 
-        # Destination number matches business tenant
-        if clean_to in self._phone_to_tenant:
-            return self._phone_to_tenant[clean_to]
-        if clean_to.lstrip("+") in self._phone_to_tenant:
-            return self._phone_to_tenant[clean_to.lstrip("+")]
+        tenants = data.get("tenants", [])
+        self.phone_to_tenant.clear()
 
-        # Direct owner communication where owner WhatsApp matches
-        if clean_from in self._phone_to_tenant:
-            return self._phone_to_tenant[clean_from]
+        # Support both list of dicts (schema 1) and dict of dicts (schema 2)
+        tenant_iterable = tenants.values() if isinstance(tenants, dict) else tenants
 
-        return None
+        for t in tenant_iterable:
+            # Check both 'id' and 'tenant_id'
+            tenant_id = t.get("id") or t.get("tenant_id")
+            if not tenant_id:
+                continue
+
+            # Check all possible registered phone numbers for the tenant
+            candidate_phones: List[str] = []
+            if t.get("owner_phone"):
+                candidate_phones.append(t.get("owner_phone"))
+            if t.get("contact_phone"):
+                candidate_phones.append(t.get("contact_phone"))
+            if t.get("whatsapp_number"):
+                candidate_phones.append(t.get("whatsapp_number"))
+
+            staff_phones = t.get("staff_phones", [])
+            if isinstance(staff_phones, list):
+                candidate_phones.extend(staff_phones)
+
+            for raw_phone in candidate_phones:
+                norm = self.normalize_phone(raw_phone)
+                if norm:
+                    if norm in self.phone_to_tenant and self.phone_to_tenant[norm] != tenant_id:
+                        logger.error(
+                            f"Phone collision: {norm} is mapped to multiple tenants "
+                            f"({self.phone_to_tenant[norm]} and {tenant_id}). Strict 1-to-1 required."
+                        )
+                    self.phone_to_tenant[norm] = tenant_id
+
+        logger.info(f"Loaded {len(self.phone_to_tenant)} phone mappings across tenants.")
+
+    def resolve_sender(self, from_number: str) -> Optional[str]:
+        norm = self.normalize_phone(from_number)
+        return self.phone_to_tenant.get(norm)
 
 
-tenant_dir = TenantDirectory()
+tenant_directory = TenantDirectory()
 
 
-def verify_twilio_signature(
-    url: str,
-    params: Dict[str, str],
-    expected_signature: str,
-    auth_token: str,
-) -> bool:
-    """Validates X-Twilio-Signature header using HMAC-SHA1 to prevent spoofing."""
-    if not auth_token or not expected_signature:
+def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_token: str) -> bool:
+    """Validates the X-Twilio-Signature HMAC-SHA1 header against post params."""
+    if not auth_token:
         return False
-
-    sorted_keys = sorted(params.keys())
-    data = url + "".join(f"{key}{params[key]}" for key in sorted_keys)
-
-    computed_mac = hmac.new(
-        auth_token.encode("utf-8"),
-        data.encode("utf-8"),
-        hashlib.sha1,
-    ).digest()
-    computed_signature = base64.b64encode(computed_mac).decode("utf-8")
-    return hmac.compare_digest(computed_signature, expected_signature)
+    data_dict = dict(parse_qsl(post_data.decode("utf-8", errors="ignore")))
+    concatenated = url + "".join(f"{k}{v}" for k, v in sorted(data_dict.items()))
+    computed = base64.b64encode(
+        hmac.new(auth_token.encode("utf-8"), concatenated.encode("utf-8"), hashlib.sha1).digest()
+    ).decode("utf-8")
+    return hmac.compare_digest(computed, signature)
 
 
 @router.post("/whatsapp")
 async def handle_whatsapp_webhook(
     request: Request,
-    x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
-    MessageSid: str = Form(...),
     From: str = Form(...),
     To: str = Form(...),
     Body: str = Form(""),
+    MessageSid: str = Form(...),
+    x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
 ):
-    """Processes incoming WhatsApp messages with idempotency checks and tenant routing."""
-    # 1. Twilio Signature Verification (Enforced if TWILIO_AUTH_TOKEN is set)
+    """Twilio WhatsApp Inbound Webhook handler."""
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-    if auth_token:
-        form_data = await request.form()
-        params = {k: str(v) for k, v in form_data.items()}
-        request_url = str(request.url)
-        if not verify_twilio_signature(request_url, params, x_twilio_signature or "", auth_token):
-            logger.warning(f"Rejected unauthenticated Twilio webhook payload from {request.client.host}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid Twilio signature header",
-            )
 
-    # 2. Idempotency Check
+    # Fail-closed security: reject if auth token is missing
+    if not auth_token:
+        logger.error("[SECURITY] TWILIO_AUTH_TOKEN is unset. Rejecting webhook (fail-closed).")
+        raise HTTPException(status_code=403, detail="Webhook authentication is unconfigured.")
+
+    # Validate HMAC signature
+    raw_body = await request.body()
+    effective_url = str(request.url)
+    if not x_twilio_signature or not verify_twilio_signature(effective_url, raw_body, x_twilio_signature, auth_token):
+        logger.warning(f"[SECURITY] Invalid Twilio signature from {request.client.host if request.client else 'unknown'}")
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    # Deduplication check
     if dedup_cache.is_duplicate(MessageSid):
-        logger.info(f"Duplicate MessageSid {MessageSid} detected. Returning cached ACK.")
+        logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={MessageSid}")
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    # 3. Dynamic Tenant Resolution
-    tenant_id = tenant_dir.resolve_tenant(to_number=To, from_number=From)
+    # Resolve tenant strictly by sender (From)
+    tenant_id = tenant_directory.resolve_sender(From)
     if not tenant_id:
-        # Default fallback to first configured tenant for dev/testing environments
-        tenant_id = "tenant_curtains_001"
+        logger.warning(f"[ROUTING REJECT] Unregistered sender: {From}. Discarding message without tenant data access.")
+        return Response(content="<Response></Response>", media_type="application/xml")
 
-    logger.info(
-        f"[ROUTED] WhatsApp Msg SID={MessageSid} | Tenant={tenant_id} | "
-        f"From={From} | Preview='{Body[:30]}...'"
-    )
-
-    # Empty TwiML instructs Twilio not to send an immediate synchronous reply
+    logger.info(f"[INGRESS ACCEPTED] MessageSid={MessageSid} | Tenant={tenant_id} | Sender={From}")
     return Response(content="<Response></Response>", media_type="application/xml")

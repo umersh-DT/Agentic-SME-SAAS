@@ -3,163 +3,118 @@ import hashlib
 import json
 import logging
 import os
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional
-from fastapi import APIRouter, Header, HTTPException, Request, Response, status
-import yaml
+import re
+import time
+from typing import Any, Dict
 
-logger = logging.getLogger("stripe_billing")
-router = APIRouter(prefix="/webhook/stripe", tags=["Stripe Billing"])
+import aiosqlite
+from fastapi import APIRouter, Header, HTTPException, Request, Response
+
+logger = logging.getLogger("gateway_stripe")
+
+router = APIRouter(prefix="/webhook", tags=["Stripe Billing"])
+
+TENANT_ID_REGEX = re.compile(r"^tenant_[a-z0-9_]+$")
 
 
 def verify_stripe_signature(payload: bytes, sig_header: str, secret: str, tolerance: int = 300) -> bool:
-    """Verifies Stripe webhook HMAC-SHA256 signature using timestamped tolerance window."""
+    """Verifies Stripe webhook HMAC-SHA256 signature and guards against replay attacks."""
     if not sig_header or not secret:
         return False
 
-    elements = dict(item.strip().split("=", 1) for item in sig_header.split(",") if "=" in item)
-    timestamp = elements.get("t")
-    signature = elements.get("v1")
+    elements = sig_header.split(",")
+    timestamp = None
+    v1_signatures = []
 
-    if not timestamp or not signature:
+    for element in elements:
+        element = element.strip()
+        if element.startswith("t="):
+            timestamp = element[2:]
+        elif element.startswith("v1="):
+            v1_signatures.append(element[3:])
+
+    if not timestamp or not v1_signatures:
         return False
 
-    # Prevent replay attacks
-    current_time = int(time.time())
-    if abs(current_time - int(timestamp)) > tolerance:
-        logger.warning("Stripe webhook timestamp outside acceptable tolerance.")
+    # Check replay window
+    try:
+        ts_int = int(timestamp)
+        if abs(time.time() - ts_int) > tolerance:
+            logger.warning("[STRIPE AUTH] Timestamp outside acceptable tolerance.")
+            return False
+    except ValueError:
         return False
 
     signed_payload = f"{timestamp}.".encode("utf-8") + payload
-    computed_sig = hmac.new(
-        secret.encode("utf-8"),
-        signed_payload,
-        hashlib.sha256,
-    ).hexdigest()
+    expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
 
-    return hmac.compare_digest(computed_sig, signature)
+    return any(hmac.compare_digest(expected, sig) for sig in v1_signatures)
 
 
-def provision_tenant_subscription(
-    tenant_id: str,
-    tier: str,
-    customer_id: str,
-    subscription_id: str,
-    config_path: str = "/app/config/tenants.yaml",
-    data_dir: str = "/app/data/tenants",
-) -> Dict[str, Any]:
-    """Updates config/tenants.yaml and creates initial SQLite storage directory."""
-    path = Path(config_path)
-    if not path.exists():
-        path = Path("config/tenants.yaml")
+async def provision_tenant_storage(tenant_id: str, plan_tier: str, base_data_dir: str = "/app/data/tenants"):
+    """Provisions an isolated SQLite database file for a newly subscribed tenant."""
+    # Strict regex check against path traversal
+    if not TENANT_ID_REGEX.match(tenant_id):
+        raise ValueError(f"Invalid tenant_id format: '{tenant_id}'. Must match ^tenant_[a-z0-9_]+$")
 
-    data = {}
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+    target_dir = Path(base_data_dir if Path(base_data_dir).exists() else "data/tenants")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    db_path = target_dir / f"{tenant_id}.sqlite"
 
-    tenants = data.get("tenants", [])
-    tenant_found = False
-
-    for t in tenants:
-        if t.get("tenant_id") == tenant_id:
-            t["plan_tier"] = tier
-            t["stripe_customer_id"] = customer_id
-            t["stripe_subscription_id"] = subscription_id
-            t["subscription_status"] = "active"
-            tenant_found = True
-            break
-
-    if not tenant_found:
-        tenants.append({
-            "tenant_id": tenant_id,
-            "business_name": f"Business {tenant_id}",
-            "plan_tier": tier,
-            "stripe_customer_id": customer_id,
-            "stripe_subscription_id": subscription_id,
-            "subscription_status": "active",
-        })
-
-    data["tenants"] = tenants
-
-    # Write updated tenants configuration
-    if path.exists():
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, default_flow_style=False)
-
-    # Initialize isolated tenant storage folder
-    target_data_dir = Path(data_dir)
-    if not target_data_dir.exists():
-        target_data_dir = Path("data/tenants")
-    target_data_dir.mkdir(parents=True, exist_ok=True)
-
-    db_path = target_data_dir / f"{tenant_id}.sqlite"
     if not db_path.exists():
-        db_path.touch()
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("PRAGMA journal_mode = WAL;")
+            await db.execute("PRAGMA foreign_keys = ON;")
+            await db.commit()
+        logger.info(f"[PROVISION] Created isolated tenant DB: {db_path.name}")
+    else:
+        logger.info(f"[PROVISION] Tenant DB already exists: {db_path.name}")
 
-    logger.info(f"[PROVISIONED] Tenant '{tenant_id}' upgraded to tier '{tier}' with SQLite db at {db_path}")
-    return {"tenant_id": tenant_id, "tier": tier, "status": "active", "db_path": str(db_path)}
 
-
-@router.post("")
+@router.post("/stripe")
 async def handle_stripe_webhook(
     request: Request,
-    stripe_signature: Optional[str] = Header(None, alias="Stripe-Signature"),
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
 ):
-    """Processes incoming Stripe subscription events (checkout.session.completed, customer.subscription.deleted)."""
-    payload = await request.body()
+    """Processes Stripe recurring billing webhooks."""
     webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
-    # Enforce signature verification when secret is configured
-    if webhook_secret:
-        if not stripe_signature or not verify_stripe_signature(payload, stripe_signature, webhook_secret):
-            logger.warning("Invalid Stripe webhook signature.")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Stripe signature",
-            )
+    # Fail-closed security
+    if not webhook_secret:
+        logger.error("[SECURITY] STRIPE_WEBHOOK_SECRET is unset. Rejecting webhook (fail-closed).")
+        raise HTTPException(status_code=400, detail="Webhook signing secret not configured.")
+
+    payload = await request.body()
+    if not verify_stripe_signature(payload, stripe_signature, webhook_secret):
+        logger.warning("[SECURITY] Invalid Stripe webhook signature.")
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature.")
 
     try:
         event = json.loads(payload.decode("utf-8"))
     except json.JSONDecodeError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
-    event_type = event.get("type", "")
-    event_data = event.get("data", {}).get("object", {})
+    event_type = event.get("type")
+    data_object = event.get("data", {}).get("object", {})
 
     if event_type == "checkout.session.completed":
-        # Extract metadata passed during checkout session creation
-        metadata = event_data.get("metadata", {})
-        tenant_id = metadata.get("tenant_id") or "tenant_curtains_001"
-        tier = metadata.get("plan_tier") or "pro"
-        customer_id = event_data.get("customer", "")
-        subscription_id = event_data.get("subscription", "")
+        metadata = data_object.get("metadata", {})
+        tenant_id = metadata.get("tenant_id")
+        plan_tier = metadata.get("plan_tier", "pro")
 
-        provision_tenant_subscription(
-            tenant_id=tenant_id,
-            tier=tier,
-            customer_id=customer_id,
-            subscription_id=subscription_id,
-        )
+        if not tenant_id:
+            logger.error("[STRIPE ERROR] checkout.session.completed missing tenant_id in metadata.")
+            raise HTTPException(status_code=400, detail="Missing tenant_id in metadata.")
+
+        if not TENANT_ID_REGEX.match(tenant_id):
+            logger.error(f"[SECURITY REJECT] Invalid tenant_id in Stripe metadata: {tenant_id}")
+            raise HTTPException(status_code=400, detail="Invalid tenant_id format.")
+
+        logger.info(f"[STRIPE BILLING] Checkout completed for tenant: {tenant_id} (Tier: {plan_tier})")
+        await provision_tenant_storage(tenant_id=tenant_id, plan_tier=plan_tier)
 
     elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
-        customer_id = event_data.get("customer", "")
-        logger.info(f"[SUBSCRIPTION SUSPENDED] Customer {customer_id} canceled subscription.")
+        logger.info(f"[STRIPE BILLING] Subscription event {event_type} received.")
 
-    return {"status": "success", "event_type": event_type}
-
-
-if __name__ == "__main__":
-    # Standalone unit test for Stripe signature verification
-    secret = "whsec_test_secret_abc123"
-    t = int(time.time())
-    dummy_payload = json.dumps({"type": "checkout.session.completed"}).encode("utf-8")
-    signed_content = f"{t}.".encode("utf-8") + dummy_payload
-    v1_sig = hmac.new(secret.encode("utf-8"), signed_content, hashlib.sha256).hexdigest()
-    valid_header = f"t={t},v1={v1_sig}"
-
-    assert verify_stripe_signature(dummy_payload, valid_header, secret) is True
-    assert verify_stripe_signature(dummy_payload, f"t={t},v1=bad_signature", secret) is False
-    assert verify_stripe_signature(dummy_payload, f"t={t - 500},v1={v1_sig}", secret) is False  # Outside tolerance
-    print("[OK] Stripe HMAC-SHA256 signature verification validated successfully.")
+    return Response(status_code=200, content='{"status":"success"}', media_type="application/json")
