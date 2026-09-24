@@ -33,3 +33,4 @@ structlog>=24.2.0
 stripe>=8.0.0
 aiosqlite>=0.20.0
 python-multipart>=0.0.9
+prometheus_client>=0.20.0

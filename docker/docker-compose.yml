@@ -1,69 +1,79 @@
-version: '3.8'
+version: "3.8"
 
 networks:
-  sme_mesh_network:
+  agentic_network:
     driver: bridge
 
-volumes:
-  tenant_storage:
-    driver: local
-
 services:
-  # ---------------------------------------------------------------------------
-  # Central Inbound WhatsApp Webhook & LLM Token Proxy Gateway
-  # ---------------------------------------------------------------------------
-  gateway:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: agentic_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../data/certbot/conf:/etc/letsencrypt
+      - ../data/certbot/www:/var/www/certbot
+    networks:
+      - agentic_network
+    depends_on:
+      - agentic_gateway
+
+  certbot:
+    image: certbot/certbot:v2.11.0
+    container_name: agentic_certbot
+    restart: unless-stopped
+    volumes:
+      - ../data/certbot/conf:/etc/letsencrypt
+      - ../data/certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  agentic_gateway:
     build:
       context: ..
       dockerfile: docker/Dockerfile.core
     container_name: agentic_gateway
-    command: ["uvicorn", "src.gateway.whatsapp:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
+    expose:
+      - "8000"
     environment:
-      - APP_ENV=${APP_ENV:-production}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PYTHONPATH=/app
       - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
       - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
     volumes:
-      - ../config:/app/config:ro
+      - ../data/tenants:/app/data/tenants
+      - ../config:/app/config
     networks:
-      - sme_mesh_network
-    restart: unless-stopped
+      - agentic_network
+    command: ["uvicorn", "src.gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-  # ---------------------------------------------------------------------------
-  # Generic Multi-Tenant OpenHuman Worker Pool (Horizontally Scalable)
-  # ---------------------------------------------------------------------------
-  tenant_worker:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.core
-    command: ["python3", "-m", "src.core.engine"]
-    environment:
-      - APP_ENV=${APP_ENV:-production}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - DATA_DIR=/app/data/tenants
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-    volumes:
-      - ../data/tenants:/app/data/tenants:rw
-      - ../config:/app/config:ro
-    networks:
-      - sme_mesh_network
-    depends_on:
-      - gateway
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: agentic_prometheus
     restart: unless-stopped
-    deploy:
-      replicas: 1
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 128M
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - agentic_network
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: agentic_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ../data/grafana:/var/lib/grafana
+    networks:
+      - agentic_network
+    depends_on:
+      - prometheus

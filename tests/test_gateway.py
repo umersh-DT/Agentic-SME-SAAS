@@ -24,7 +24,7 @@ class TestGatewayWebhook(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["status"], "healthy")
         self.assertEqual(data["service"], "agentic-gateway")
-        self.assertEqual(data["phase"], 3)
+        self.assertEqual(data["phase"], 4)
 
     def test_twilio_signature_verification_logic(self):
         token = "test_auth_token_secret_12345"
