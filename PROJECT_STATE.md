@@ -30,3 +30,11 @@
 - **Staging VPS:** Hetzner Cloud (`167.233.67.253`), Ubuntu 24.04 LTS.
 - **Architecture Model:** Single shared gateway/worker container using isolated SQLite databases per tenant (`data/tenants/{tenant_id}.sqlite`).
 - **Telemetry & Edge:** Prometheus and Grafana restricted to internal Docker network; `/metrics` blocked from public ingress in Nginx.
+
+## Current Status: Stage 2 Remediated (Pending Re-Review Approval)
+- Unified TenantConfig Pydantic model with strict E.164 (`^\+[1-9]\d{1,14}$`) validation.
+- Stripe billing webhook provisions SQLite asynchronously and registers tenant into `config/tenants.yaml`.
+- Stripe provisioning failures return HTTP 500 to preserve Stripe webhook retry semantics.
+- Canned customer autoreply removed from `dispatcher.py`.
+- Rate-limited graceful rejection for unregistered senders via TwiML.
+- Unit test suite expanded to 19 hermetic tests covering unmocked directory routing, collision rejection, and isolated temporary directories.

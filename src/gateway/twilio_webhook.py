@@ -38,7 +38,24 @@ class DeduplicationCache:
             del self._cache[sid]
 
 
+class RejectionRateLimiter:
+    """Prevents outbound TwiML message bombing by rate limiting rejection replies per unmapped phone."""
+
+    def __init__(self, cooldown_seconds: int = 60):
+        self.cooldown = cooldown_seconds
+        self._last_reply: Dict[str, float] = {}
+
+    def should_reply(self, phone: str) -> bool:
+        now = time.time()
+        last = self._last_reply.get(phone, 0.0)
+        if now - last < self.cooldown:
+            return False
+        self._last_reply[phone] = now
+        return True
+
+
 dedup_cache = DeduplicationCache()
+rejection_limiter = RejectionRateLimiter(cooldown_seconds=60)
 
 
 class StrictTenantDirectory:
@@ -52,11 +69,12 @@ class StrictTenantDirectory:
         self.reload_tenants()
 
     def reload_tenants(self) -> None:
-        if not os.path.exists(self.config_path):
-            logger.warning(f"Tenant configuration file not found at: {self.config_path}")
+        effective_path = os.environ.get("TENANTS_CONFIG_PATH", self.config_path)
+        if not os.path.exists(effective_path):
+            logger.warning(f"Tenant configuration file not found at: {effective_path}")
             return
 
-        with open(self.config_path, "r", encoding="utf-8") as f:
+        with open(effective_path, "r", encoding="utf-8") as f:
             raw_data = yaml.safe_load(f) or {}
 
         tenants_raw = raw_data.get("tenants", [])
@@ -67,23 +85,22 @@ class StrictTenantDirectory:
         self.collided_phones.clear()
 
         for item in tenant_list:
-            # Map legacy 'id' to 'tenant_id' if necessary during migration
             if "id" in item and "tenant_id" not in item:
                 item["tenant_id"] = item["id"]
             if "active_plan" in item and "plan_tier" not in item:
                 item["plan_tier"] = item["active_plan"]
 
+            # Fail fast on startup for schema violations
             try:
                 config = TenantConfig(**item)
             except Exception as e:
-                logger.error(f"[REGISTRY SCHEMA ERROR] Invalid tenant configuration: {item.get('tenant_id')}: {e}")
-                continue
+                logger.critical(f"[STARTUP FATAL] Invalid tenant schema in {effective_path}: {e}")
+                raise ValueError(f"Startup failed: invalid tenant configuration: {e}") from e
 
             self.tenants[config.tenant_id] = config
 
             for phone in config.get_all_associated_phones():
                 if phone in self.collided_phones:
-                    logger.error(f"[COLLISION EXCLUSION] Skipping {phone}: previously conflicted.")
                     continue
 
                 if phone in self.phone_to_tenant and self.phone_to_tenant[phone] != config.tenant_id:
@@ -91,14 +108,14 @@ class StrictTenantDirectory:
                     self.collided_phones.add(phone)
                     logger.error(
                         f"[FATAL PHONE COLLISION] Phone {phone} claimed by both {other_tenant} and "
-                        f"{config.tenant_id}. Dropping from both to prevent cross-tenant data leakage."
+                        f"{config.tenant_id}. Dropped from both to prevent cross-tenant data leakage."
                     )
                 else:
                     self.phone_to_tenant[phone] = config.tenant_id
 
         logger.info(
             f"Loaded {len(self.tenants)} tenants with {len(self.phone_to_tenant)} unique active phone mappings. "
-            f"Collisions dropped: {len(self.collided_phones)}"
+            f"Collisions: {len(self.collided_phones)}"
         )
 
     def resolve_sender(self, from_number: str) -> Optional[str]:
@@ -150,20 +167,23 @@ async def handle_whatsapp_webhook(
     # Deduplication check
     if dedup_cache.is_duplicate(message_sid):
         logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
-        return Response(content="<Response></Response>", media_type="application/xml")
+        # Return 200 with X-Dedup-Dropped header to verify drop behavior in tests
+        return Response(content="<Response></Response>", media_type="application/xml", headers={"X-Dedup-Dropped": "true"})
 
     # Strict sender-only resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
-        logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}. Returning graceful rejection.")
-        rejection_twiml = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            "<Response>\n"
-            "  <Message>This phone number is not registered with an active business assistant. "
-            "Please contact your business administrator.</Message>\n"
-            "</Response>"
-        )
-        return Response(content=rejection_twiml, media_type="application/xml")
+        logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}.")
+        if rejection_limiter.should_reply(from_number):
+            rejection_twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Response>\n"
+                "  <Message>This phone number is not registered with an active business assistant. "
+                "Please contact your business administrator.</Message>\n"
+                "</Response>"
+            )
+            return Response(content=rejection_twiml, media_type="application/xml")
+        return Response(content="<Response></Response>", media_type="application/xml")
 
     logger.info(f"[INGRESS ACCEPTED] MessageSid={message_sid} | Tenant={tenant_id} | Sender={from_number}")
     return Response(content="<Response></Response>", media_type="application/xml")

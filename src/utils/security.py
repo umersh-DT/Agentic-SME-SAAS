@@ -6,16 +6,20 @@ from pydantic import BaseModel, Field, field_validator
 
 
 TENANT_ID_REGEX = re.compile(r"^tenant_[a-z0-9_]+$")
+E164_REGEX = re.compile(r"^\+[1-9]\d{1,14}$")
 
 
 def normalize_phone_number(phone: Optional[str]) -> str:
-    """Normalizes phone numbers by stripping whatsapp prefixes, spaces, and hyphens."""
+    """Normalizes phone numbers to strict E.164 (+[1-9]digits) by stripping whitespace, hyphens, and whatsapp: prefixes."""
     if not phone:
         return ""
-    cleaned = phone.strip()
+    cleaned = str(phone).strip()
     if cleaned.startswith("whatsapp:"):
         cleaned = cleaned.replace("whatsapp:", "")
-    return cleaned.replace(" ", "").replace("-", "").strip()
+    cleaned = cleaned.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
+    if cleaned and not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+    return cleaned
 
 
 class TenantConfig(BaseModel):
@@ -24,9 +28,9 @@ class TenantConfig(BaseModel):
     business_name: str = Field(..., min_length=2)
     plan_tier: Literal["starter", "pro", "enterprise"] = "starter"
     subscription_status: Literal["active", "past_due", "canceled"] = "active"
-    whatsapp_number: Optional[str] = Field(None, description="Primary business WhatsApp phone number")
-    owner_phone: Optional[str] = Field(None, description="Owner contact phone number")
-    staff_phones: List[str] = Field(default_factory=list, description="Authorized staff phone numbers")
+    whatsapp_number: Optional[str] = Field(None, description="Primary business WhatsApp phone number in E.164")
+    owner_phone: Optional[str] = Field(None, description="Owner contact phone number in E.164")
+    staff_phones: List[str] = Field(default_factory=list, description="Authorized staff phone numbers in E.164")
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
     enabled_skills: List[str] = Field(
@@ -46,22 +50,29 @@ class TenantConfig(BaseModel):
 
     @field_validator("whatsapp_number", "owner_phone", mode="before")
     @classmethod
-    def sanitize_single_phone(cls, v: Optional[str]) -> Optional[str]:
+    def validate_and_sanitize_single_phone(cls, v: Optional[str]) -> Optional[str]:
         if not v:
             return None
         norm = normalize_phone_number(v)
-        return norm if norm else None
+        if not E164_REGEX.match(norm):
+            raise ValueError(f"Invalid E.164 phone number format: '{v}' (normalized: '{norm}')")
+        return norm
 
     @field_validator("staff_phones", mode="before")
     @classmethod
-    def sanitize_phone_list(cls, v: Optional[List[str]]) -> List[str]:
+    def validate_and_sanitize_phone_list(cls, v: Optional[List[str]]) -> List[str]:
         if not v:
             return []
-        cleaned_list = [normalize_phone_number(p) for p in v if normalize_phone_number(p)]
+        cleaned_list = []
+        for p in v:
+            norm = normalize_phone_number(p)
+            if not E164_REGEX.match(norm):
+                raise ValueError(f"Invalid E.164 phone number in staff_phones: '{p}' (normalized: '{norm}')")
+            cleaned_list.append(norm)
         return list(dict.fromkeys(cleaned_list))
 
     def get_all_associated_phones(self) -> List[str]:
-        """Collects all unique phone numbers associated with this tenant."""
+        """Collects all unique normalized phone numbers associated with this tenant."""
         phones = []
         if self.whatsapp_number:
             phones.append(self.whatsapp_number)
