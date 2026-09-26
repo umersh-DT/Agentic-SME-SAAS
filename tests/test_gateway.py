@@ -22,6 +22,10 @@ class TestGatewayWebhook(unittest.TestCase):
         self.stripe_secret = "whsec_mock_test_secret_9988"
         self.webhook_url = "http://testserver/webhook/whatsapp"
 
+    def tearDown(self):
+        # Guarantee global tenant_directory is restored to repository state
+        tenant_directory.reload_tenants()
+
     def _generate_twilio_signature(self, url: str, params: dict, token: str) -> str:
         concatenated = url + "".join(f"{k}{v}" for k, v in sorted(params.items()))
         return base64.b64encode(
@@ -49,7 +53,6 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertEqual(response.status_code, 403)
 
     def test_strict_tenant_directory_live_resolution_and_collision(self):
-        """Hermetically tests real StrictTenantDirectory loading, matching, and collision drops without mocks."""
         with tempfile.NamedTemporaryFile("w+", suffix=".yaml", delete=False) as f:
             yaml.safe_dump({
                 "tenants": [
@@ -63,7 +66,7 @@ class TestGatewayWebhook(unittest.TestCase):
                         "tenant_id": "tenant_beta_02",
                         "business_name": "Beta Co",
                         "owner_phone": "+971503333333",
-                        "staff_phones": ["+971502222222"],  # Collision on +971502222222!
+                        "staff_phones": ["+971502222222"],
                     }
                 ]
             }, f)
@@ -71,10 +74,8 @@ class TestGatewayWebhook(unittest.TestCase):
 
         try:
             directory = StrictTenantDirectory(config_path=temp_path)
-            # Distinct numbers resolve
             self.assertEqual(directory.resolve_sender("+971501111111"), "tenant_alpha_01")
             self.assertEqual(directory.resolve_sender("+971503333333"), "tenant_beta_02")
-            # Collided phone must be dropped from BOTH tenants
             self.assertIsNone(directory.resolve_sender("+971502222222"))
             self.assertIn("+971502222222", directory.collided_phones)
         finally:
@@ -82,7 +83,6 @@ class TestGatewayWebhook(unittest.TestCase):
                 os.remove(temp_path)
 
     def test_twilio_signed_text_message_registered_sender(self):
-        """Verifies that an unmocked registered sender in tenants.yaml is routed with 200."""
         payload = {
             "From": "+971501234567",
             "To": "+17372508034",
@@ -111,7 +111,6 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertIn("<Response></Response>", response.text)
 
     def test_twilio_duplicate_message_dropped(self):
-        """Verifies duplicate MessageSid is recognized and dropped via X-Dedup-Dropped header."""
         payload = {
             "From": "+971501234567",
             "To": "+17372508034",
@@ -159,6 +158,7 @@ class TestGatewayWebhook(unittest.TestCase):
                     "metadata": {
                         "tenant_id": "../../etc/malicious",
                         "plan_tier": "pro",
+                        "owner_phone": "+971501112233",
                     }
                 }
             }
@@ -174,7 +174,6 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertEqual(response.json().get("status"), "ignored_malformed_tenant_id")
 
     def test_stripe_internal_provisioning_failure_returns_500(self):
-        """Verifies that an internal provisioning error returns HTTP 500 so Stripe retries."""
         ts = str(int(time.time()))
         payload = json.dumps({
             "type": "checkout.session.completed",
@@ -183,6 +182,7 @@ class TestGatewayWebhook(unittest.TestCase):
                     "metadata": {
                         "tenant_id": "tenant_broken_001",
                         "plan_tier": "pro",
+                        "owner_phone": "+971508889900",
                     }
                 }
             }
@@ -198,7 +198,6 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertEqual(response.status_code, 500)
 
     def test_stripe_valid_checkout_provisions_and_registers_hermetically(self):
-        """Verifies that a valid checkout creates storage and updates tenants.yaml so tenant is routable."""
         ts = str(int(time.time()))
         tenant_id = "tenant_hermetic_99"
         phone = "+971509998877"
@@ -236,12 +235,81 @@ class TestGatewayWebhook(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
 
-                # Verify SQLite database was provisioned in temp_dir
                 expected_db = os.path.join(temp_dir, f"{tenant_id}.sqlite")
                 self.assertTrue(os.path.exists(expected_db))
-
-                # Verify tenant was added to tenants.yaml and in-memory directory
                 self.assertEqual(tenant_directory.resolve_sender(phone), tenant_id)
+
+    def test_stripe_checkout_with_existing_phone_rejected_without_disrupting_existing_tenant(self):
+        """BLOCKER 1: Verifies new checkout with existing phone is rejected (200) without taking current tenant offline."""
+        ts = str(int(time.time()))
+        existing_phone = "+971501234567"  # Owned by tenant_curtains_001 in config/tenants.yaml
+        payload = json.dumps({
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "metadata": {
+                        "tenant_id": "tenant_hijacker_99",
+                        "business_name": "Hijack Attempt Ltd",
+                        "plan_tier": "pro",
+                        "owner_phone": existing_phone,
+                    }
+                }
+            }
+        }).encode("utf-8")
+        sig = hmac.new(self.stripe_secret.encode("utf-8"), f"{ts}.".encode("utf-8") + payload, hashlib.sha256).hexdigest()
+
+        with patch.dict("os.environ", {"STRIPE_WEBHOOK_SECRET": self.stripe_secret}):
+            response = self.client.post(
+                "/webhook/stripe",
+                content=payload,
+                headers={"Stripe-Signature": f"t={ts},v1={sig}"},
+            )
+            # Must return 200 to halt retry loop
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json().get("status"), "ignored_phone_already_registered")
+            # Existing paying customer MUST still be active and routed
+            self.assertEqual(tenant_directory.resolve_sender(existing_phone), "tenant_curtains_001")
+
+    def test_stripe_checkout_malformed_phone_returns_200_and_does_not_corrupt_yaml(self):
+        """BLOCKER 2: Verifies non-E.164 phone returns 200 customer defect and does not poison tenants.yaml."""
+        ts = str(int(time.time()))
+        payload = json.dumps({
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "metadata": {
+                        "tenant_id": "tenant_bad_phone_01",
+                        "business_name": "Bad Phone Business",
+                        "plan_tier": "starter",
+                        "owner_phone": "0501112233",  # Missing leading '+' and country code
+                    }
+                }
+            }
+        }).encode("utf-8")
+        sig = hmac.new(self.stripe_secret.encode("utf-8"), f"{ts}.".encode("utf-8") + payload, hashlib.sha256).hexdigest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_yaml = os.path.join(temp_dir, "tenants.yaml")
+            with open(temp_yaml, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"tenants": []}, f)
+
+            with patch.dict("os.environ", {
+                "STRIPE_WEBHOOK_SECRET": self.stripe_secret,
+                "TENANTS_CONFIG_PATH": temp_yaml,
+                "TENANTS_DATA_DIR": temp_dir,
+            }):
+                response = self.client.post(
+                    "/webhook/stripe",
+                    content=payload,
+                    headers={"Stripe-Signature": f"t={ts},v1={sig}"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json().get("status"), "ignored_invalid_customer_data")
+
+                # Verify nothing bad was written into YAML
+                with open(temp_yaml, "r", encoding="utf-8") as f:
+                    content = yaml.safe_load(f)
+                    self.assertEqual(len(content.get("tenants", [])), 0)
 
 
 if __name__ == "__main__":

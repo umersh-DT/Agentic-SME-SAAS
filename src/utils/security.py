@@ -6,20 +6,18 @@ from pydantic import BaseModel, Field, field_validator
 
 
 TENANT_ID_REGEX = re.compile(r"^tenant_[a-z0-9_]+$")
-E164_REGEX = re.compile(r"^\+[1-9]\d{1,14}$")
+# Strict E.164: must start with '+' followed by country code and subscriber digits (total 7-15 digits)
+E164_REGEX = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
 def normalize_phone_number(phone: Optional[str]) -> str:
-    """Normalizes phone numbers to strict E.164 (+[1-9]digits) by stripping whitespace, hyphens, and whatsapp: prefixes."""
+    """Normalizes phone numbers by stripping whatsapp: prefix, spaces, and formatting characters."""
     if not phone:
         return ""
     cleaned = str(phone).strip()
     if cleaned.startswith("whatsapp:"):
         cleaned = cleaned.replace("whatsapp:", "")
-    cleaned = cleaned.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
-    if cleaned and not cleaned.startswith("+"):
-        cleaned = "+" + cleaned
-    return cleaned
+    return cleaned.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
 
 
 class TenantConfig(BaseModel):
@@ -55,7 +53,7 @@ class TenantConfig(BaseModel):
             return None
         norm = normalize_phone_number(v)
         if not E164_REGEX.match(norm):
-            raise ValueError(f"Invalid E.164 phone number format: '{v}' (normalized: '{norm}')")
+            raise ValueError(f"Invalid E.164 phone number format: '{v}' (normalized: '{norm}'). Must include leading '+' and country code.")
         return norm
 
     @field_validator("staff_phones", mode="before")
@@ -67,7 +65,7 @@ class TenantConfig(BaseModel):
         for p in v:
             norm = normalize_phone_number(p)
             if not E164_REGEX.match(norm):
-                raise ValueError(f"Invalid E.164 phone number in staff_phones: '{p}' (normalized: '{norm}')")
+                raise ValueError(f"Invalid E.164 phone number in staff_phones: '{p}'. Must include leading '+' and country code.")
             cleaned_list.append(norm)
         return list(dict.fromkeys(cleaned_list))
 

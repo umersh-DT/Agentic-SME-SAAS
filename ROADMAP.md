@@ -16,31 +16,27 @@
 
 ---
 
-## Remediation Roadmap: Production Working Loop
+# Roadmap: Agentic SME SaaS
 
-### Stage 1: Documentation Baseline & Security Hardening (COMPLETED)
-- [x] Realign `PROJECT_STATE.md` and `ROADMAP.md` to reflect verified working code.
-- [x] Enforce fail-closed authentication on Twilio and Stripe webhooks (reject requests if secrets are unset).
-- [x] Add `STRIPE_WEBHOOK_SECRET` and `GRAFANA_ADMIN_PASSWORD` to `.env.example`.
-- [x] Sanitize `tenant_id` with regex (`^tenant_[a-z0-9_]+$`) to prevent directory traversal in file provisioning.
-- [x] Remove public host port bindings for Prometheus (9090) and Grafana (3000); block `/metrics` in Nginx.
-- [x] Eliminate hardcoded `tenant_curtains_001` fallback and fix `tenant_id` vs `id` directory lookup.
+## Stage 1: Documentation Reset & Security Hardening
+- [x] Canonical documentation reset
+- [x] Security audit & hermetic tests
+- [x] Staging deployment (Approved - d7a7488, ab71b3c)
 
-### Stage 2: Single Tenant Registry & Routing Engine (NEXT)
-- [ ] Unify tenant schema (`TenantConfig`) across `config/tenants.yaml`, `src/utils/security.py`, and provisioning.
-- [ ] Route exclusively by sender phone (`From`) and enforce strict one-to-one phone-to-tenant mapping.
-- [ ] Return polite "Sender not registered" response for unknown phone numbers without touching tenant storage.
-- [ ] Remove `config/tenants_pilot.yaml` and standardize on single configuration registry.
+## Stage 2: Tenant Registry & Ingress Routing
+- [x] Single TenantConfig Pydantic Schema & Strict E.164 (`^\+[1-9]\d{6,14}$`)
+- [x] Single canonical `config/tenants.yaml`
+- [x] Sender-only deterministic 1-to-1 phone routing
+- [x] Phone collision protection (existing paying tenants protected from checkout takeovers)
+- [x] In-memory TenantConfig pre-validation before atomic YAML write
+- [x] Non-retryable metadata defects return 200; operational failures return 500
+- [x] Daily rate-limited unmapped sender rejection TwiML
+- [x] Hermetic automated test suite (21/21 passing, clean unmocked directory tests)
+- **Status:** Complete & Remediated (Ready for Final Sign-Off)
 
-### Stage 3: End-to-End Agent Execution Loop
-- [ ] Build `src/core/agent.py` using LiteLLM for structured tool calling and per-tenant token cost metering.
-- [ ] Wire `src/gateway/twilio_webhook.py` $\to$ FastAPI `BackgroundTasks` $\to$ `dispatcher.py`.
-- [ ] Connect agent output directly to `WhatsAppReplySkill` for automated outbound responses.
-- [ ] Configure Uvicorn `--proxy-headers --forwarded-allow-ips=*` for production TLS signature validation.
-- [ ] End-to-end integration test: Owner WhatsApp message $\to$ Tool invocation (Invoice) $\to$ WhatsApp response.
-
-### Stage 4: High-Value Skills, Billing Lifecycle & Hermetic CI
-- [ ] Invoicing enhancements: Binary PDF generation (`reportlab`), persistent invoice numbers, and Stripe Payment Links.
-- [ ] Inbound voice note transcription via Twilio media attachments (`MediaUrl0`).
-- [ ] Full Stripe lifecycle: Checkout session creation, welcome template dispatch, and cancellation suspension.
-- [ ] Hermetic unit tests (using ephemeral `tempfile` directories) and GitHub Actions CI workflow.
+## Stage 3: Agentic Core & Business Skill Pipeline [NEXT]
+- [ ] LiteLLM integration with single model provider
+- [ ] Per-tenant token metering and usage limits
+- [ ] Context extractor & dynamic tool calling
+- [ ] Memory tree FTS5 search & CRM state tracking
+- [ ] Uvicorn reverse-proxy headers (`--proxy-headers --forwarded-allow-ips=*`)

@@ -18,8 +18,6 @@ router = APIRouter(prefix="/webhook", tags=["Twilio Ingress"])
 
 
 class DeduplicationCache:
-    """In-memory sliding-window cache to drop duplicate Twilio MessageSids."""
-
     def __init__(self, ttl_seconds: int = 600):
         self.ttl = ttl_seconds
         self._cache: Dict[str, float] = {}
@@ -39,28 +37,33 @@ class DeduplicationCache:
 
 
 class RejectionRateLimiter:
-    """Prevents outbound TwiML message bombing by rate limiting rejection replies per unmapped phone."""
+    """Limits rejection TwiML to once per 24 hours (86,400 seconds) per sender to suppress spam."""
 
-    def __init__(self, cooldown_seconds: int = 60):
+    def __init__(self, cooldown_seconds: int = 86400):
         self.cooldown = cooldown_seconds
         self._last_reply: Dict[str, float] = {}
 
     def should_reply(self, phone: str) -> bool:
         now = time.time()
+        self._purge_stale(now)
         last = self._last_reply.get(phone, 0.0)
         if now - last < self.cooldown:
             return False
         self._last_reply[phone] = now
         return True
 
+    def _purge_stale(self, now: float) -> None:
+        stale_threshold = now - (self.cooldown * 2)
+        expired = [p for p, ts in self._last_reply.items() if ts < stale_threshold]
+        for p in expired:
+            del self._last_reply[p]
+
 
 dedup_cache = DeduplicationCache()
-rejection_limiter = RejectionRateLimiter(cooldown_seconds=60)
+rejection_limiter = RejectionRateLimiter(cooldown_seconds=86400)
 
 
 class StrictTenantDirectory:
-    """Loads tenant registry with TenantConfig validation and enforces collision-free 1-to-1 routing."""
-
     def __init__(self, config_path: str = "config/tenants.yaml"):
         self.config_path = config_path
         self.phone_to_tenant: Dict[str, str] = {}
@@ -90,7 +93,6 @@ class StrictTenantDirectory:
             if "active_plan" in item and "plan_tier" not in item:
                 item["plan_tier"] = item["active_plan"]
 
-            # Fail fast on startup for schema violations
             try:
                 config = TenantConfig(**item)
             except Exception as e:
@@ -108,14 +110,13 @@ class StrictTenantDirectory:
                     self.collided_phones.add(phone)
                     logger.error(
                         f"[FATAL PHONE COLLISION] Phone {phone} claimed by both {other_tenant} and "
-                        f"{config.tenant_id}. Dropped from both to prevent cross-tenant data leakage."
+                        f"{config.tenant_id}. Dropped from both."
                     )
                 else:
                     self.phone_to_tenant[phone] = config.tenant_id
 
         logger.info(
-            f"Loaded {len(self.tenants)} tenants with {len(self.phone_to_tenant)} unique active phone mappings. "
-            f"Collisions: {len(self.collided_phones)}"
+            f"Loaded {len(self.tenants)} tenants with {len(self.phone_to_tenant)} unique active phone mappings."
         )
 
     def resolve_sender(self, from_number: str) -> Optional[str]:
@@ -127,7 +128,6 @@ tenant_directory = StrictTenantDirectory()
 
 
 def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_token: str) -> bool:
-    """Validates the X-Twilio-Signature HMAC-SHA1 header against post params."""
     if not auth_token:
         return False
     data_dict = dict(parse_qsl(post_data.decode("utf-8", errors="ignore"), keep_blank_values=True))
@@ -143,7 +143,6 @@ async def handle_whatsapp_webhook(
     request: Request,
     x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
 ):
-    """Twilio WhatsApp Inbound Webhook handler."""
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 
     if not auth_token:
@@ -154,7 +153,7 @@ async def handle_whatsapp_webhook(
     effective_url = str(request.url)
 
     if not x_twilio_signature or not verify_twilio_signature(effective_url, raw_body, x_twilio_signature, auth_token):
-        logger.warning(f"[SECURITY] Invalid Twilio signature from {request.client.host if request.client else 'unknown'}")
+        logger.warning(f"[SECURITY] Invalid Twilio signature")
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     form_params = dict(parse_qsl(raw_body.decode("utf-8", errors="ignore"), keep_blank_values=True))
@@ -164,13 +163,10 @@ async def handle_whatsapp_webhook(
     if not message_sid:
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    # Deduplication check
     if dedup_cache.is_duplicate(message_sid):
         logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
-        # Return 200 with X-Dedup-Dropped header to verify drop behavior in tests
         return Response(content="<Response></Response>", media_type="application/xml", headers={"X-Dedup-Dropped": "true"})
 
-    # Strict sender-only resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
         logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}.")
