@@ -4,11 +4,13 @@ import hmac
 import logging
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional, Set
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 import yaml
+
+from src.utils.security import TenantConfig, normalize_phone_number
 
 logger = logging.getLogger("gateway_twilio")
 
@@ -39,23 +41,15 @@ class DeduplicationCache:
 dedup_cache = DeduplicationCache()
 
 
-class TenantDirectory:
-    """Loads tenant registry and resolves incoming sender phone numbers to tenant IDs."""
+class StrictTenantDirectory:
+    """Loads tenant registry with TenantConfig validation and enforces collision-free 1-to-1 routing."""
 
     def __init__(self, config_path: str = "config/tenants.yaml"):
         self.config_path = config_path
         self.phone_to_tenant: Dict[str, str] = {}
+        self.tenants: Dict[str, TenantConfig] = {}
+        self.collided_phones: Set[str] = set()
         self.reload_tenants()
-
-    @staticmethod
-    def normalize_phone(phone: Optional[str]) -> str:
-        """Strips whatsapp: prefixes, spaces, and hyphens to normalize to standard E.164."""
-        if not phone:
-            return ""
-        cleaned = phone.strip()
-        if cleaned.startswith("whatsapp:"):
-            cleaned = cleaned.replace("whatsapp:", "")
-        return cleaned.replace(" ", "").replace("-", "").strip()
 
     def reload_tenants(self) -> None:
         if not os.path.exists(self.config_path):
@@ -63,49 +57,56 @@ class TenantDirectory:
             return
 
         with open(self.config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            raw_data = yaml.safe_load(f) or {}
 
-        tenants = data.get("tenants", [])
+        tenants_raw = raw_data.get("tenants", [])
+        tenant_list = tenants_raw.values() if isinstance(tenants_raw, dict) else tenants_raw
+
         self.phone_to_tenant.clear()
+        self.tenants.clear()
+        self.collided_phones.clear()
 
-        # Support both list of dicts (schema 1) and dict of dicts (schema 2)
-        tenant_iterable = tenants.values() if isinstance(tenants, dict) else tenants
+        for item in tenant_list:
+            # Map legacy 'id' to 'tenant_id' if necessary during migration
+            if "id" in item and "tenant_id" not in item:
+                item["tenant_id"] = item["id"]
+            if "active_plan" in item and "plan_tier" not in item:
+                item["plan_tier"] = item["active_plan"]
 
-        for t in tenant_iterable:
-            tenant_id = t.get("id") or t.get("tenant_id")
-            if not tenant_id:
+            try:
+                config = TenantConfig(**item)
+            except Exception as e:
+                logger.error(f"[REGISTRY SCHEMA ERROR] Invalid tenant configuration: {item.get('tenant_id')}: {e}")
                 continue
 
-            candidate_phones: List[str] = []
-            if t.get("owner_phone"):
-                candidate_phones.append(t.get("owner_phone"))
-            if t.get("contact_phone"):
-                candidate_phones.append(t.get("contact_phone"))
-            if t.get("whatsapp_number"):
-                candidate_phones.append(t.get("whatsapp_number"))
+            self.tenants[config.tenant_id] = config
 
-            staff_phones = t.get("staff_phones", [])
-            if isinstance(staff_phones, list):
-                candidate_phones.extend(staff_phones)
+            for phone in config.get_all_associated_phones():
+                if phone in self.collided_phones:
+                    logger.error(f"[COLLISION EXCLUSION] Skipping {phone}: previously conflicted.")
+                    continue
 
-            for raw_phone in candidate_phones:
-                norm = self.normalize_phone(raw_phone)
-                if norm:
-                    if norm in self.phone_to_tenant and self.phone_to_tenant[norm] != tenant_id:
-                        logger.error(
-                            f"Phone collision: {norm} is mapped to multiple tenants "
-                            f"({self.phone_to_tenant[norm]} and {tenant_id}). Strict 1-to-1 required."
-                        )
-                    self.phone_to_tenant[norm] = tenant_id
+                if phone in self.phone_to_tenant and self.phone_to_tenant[phone] != config.tenant_id:
+                    other_tenant = self.phone_to_tenant.pop(phone)
+                    self.collided_phones.add(phone)
+                    logger.error(
+                        f"[FATAL PHONE COLLISION] Phone {phone} claimed by both {other_tenant} and "
+                        f"{config.tenant_id}. Dropping from both to prevent cross-tenant data leakage."
+                    )
+                else:
+                    self.phone_to_tenant[phone] = config.tenant_id
 
-        logger.info(f"Loaded {len(self.phone_to_tenant)} phone mappings across tenants.")
+        logger.info(
+            f"Loaded {len(self.tenants)} tenants with {len(self.phone_to_tenant)} unique active phone mappings. "
+            f"Collisions dropped: {len(self.collided_phones)}"
+        )
 
     def resolve_sender(self, from_number: str) -> Optional[str]:
-        norm = self.normalize_phone(from_number)
+        norm = normalize_phone_number(from_number)
         return self.phone_to_tenant.get(norm)
 
 
-tenant_directory = TenantDirectory()
+tenant_directory = StrictTenantDirectory()
 
 
 def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_token: str) -> bool:
@@ -128,12 +129,10 @@ async def handle_whatsapp_webhook(
     """Twilio WhatsApp Inbound Webhook handler."""
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 
-    # Fail-closed security: reject if auth token is missing
     if not auth_token:
         logger.error("[SECURITY] TWILIO_AUTH_TOKEN is unset. Rejecting webhook (fail-closed).")
         raise HTTPException(status_code=403, detail="Webhook authentication is unconfigured.")
 
-    # Read raw body directly without Form(...) consuming the stream
     raw_body = await request.body()
     effective_url = str(request.url)
 
@@ -141,13 +140,11 @@ async def handle_whatsapp_webhook(
         logger.warning(f"[SECURITY] Invalid Twilio signature from {request.client.host if request.client else 'unknown'}")
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    # Parse form parameters with empty value preservation
     form_params = dict(parse_qsl(raw_body.decode("utf-8", errors="ignore"), keep_blank_values=True))
     from_number = form_params.get("From", "")
     message_sid = form_params.get("MessageSid", "")
 
     if not message_sid:
-        logger.warning("[GATEWAY] Missing MessageSid in valid webhook payload.")
         return Response(content="<Response></Response>", media_type="application/xml")
 
     # Deduplication check
@@ -155,11 +152,18 @@ async def handle_whatsapp_webhook(
         logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    # Resolve tenant strictly by sender (From)
+    # Strict sender-only resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
-        logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}. Discarding message without tenant data access.")
-        return Response(content="<Response></Response>", media_type="application/xml")
+        logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}. Returning graceful rejection.")
+        rejection_twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            "  <Message>This phone number is not registered with an active business assistant. "
+            "Please contact your business administrator.</Message>\n"
+            "</Response>"
+        )
+        return Response(content=rejection_twiml, media_type="application/xml")
 
     logger.info(f"[INGRESS ACCEPTED] MessageSid={message_sid} | Tenant={tenant_id} | Sender={from_number}")
     return Response(content="<Response></Response>", media_type="application/xml")

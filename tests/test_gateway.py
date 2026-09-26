@@ -58,7 +58,7 @@ class TestGatewayWebhook(unittest.TestCase):
         }
         sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
         with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token}), \
-             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_pilot_001"):
+             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_curtains_001"):
             response = self.client.post(
                 "/webhook/whatsapp",
                 data=payload,
@@ -79,13 +79,14 @@ class TestGatewayWebhook(unittest.TestCase):
         }
         sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
         with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token}), \
-             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_pilot_001"):
+             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_curtains_001"):
             response = self.client.post(
                 "/webhook/whatsapp",
                 data=payload,
                 headers={"X-Twilio-Signature": sig},
             )
             self.assertEqual(response.status_code, 200)
+            self.assertIn("<Response></Response>", response.text)
 
     def test_twilio_duplicate_message_dropped(self):
         """Verifies that duplicate MessageSid entries are dropped by deduplication cache."""
@@ -97,7 +98,7 @@ class TestGatewayWebhook(unittest.TestCase):
         }
         sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
         with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token}), \
-             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_pilot_001"):
+             patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value="tenant_curtains_001"):
             r1 = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
             self.assertEqual(r1.status_code, 200)
 
@@ -105,7 +106,7 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertEqual(r2.status_code, 200)
 
     def test_twilio_unregistered_sender_discarded_gracefully(self):
-        """Verifies that an unregistered sender gets empty 200 TwiML without touching storage."""
+        """Verifies that an unregistered sender gets polite rejection TwiML without touching storage."""
         payload = {
             "From": "+99900000000",
             "To": "+17372508034",
@@ -117,7 +118,7 @@ class TestGatewayWebhook(unittest.TestCase):
              patch("src.gateway.twilio_webhook.tenant_directory.resolve_sender", return_value=None):
             response = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
             self.assertEqual(response.status_code, 200)
-            self.assertIn("<Response></Response>", response.text)
+            self.assertIn("<Message>This phone number is not registered", response.text)
 
     def test_stripe_fail_closed_without_secret(self):
         """Verifies that webhook rejects requests with 400 if STRIPE_WEBHOOK_SECRET is unset."""
@@ -130,7 +131,7 @@ class TestGatewayWebhook(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
 
     def test_stripe_path_traversal_rejected(self):
-        """Verifies that an invalid tenant_id (e.g. traversal attempt) is rejected with 400."""
+        """Verifies that malformed tenant_id logs security reject and returns 200 to halt Stripe retries."""
         ts = str(int(time.time()))
         payload = json.dumps({
             "type": "checkout.session.completed",
@@ -154,7 +155,9 @@ class TestGatewayWebhook(unittest.TestCase):
                 content=payload,
                 headers={"Stripe-Signature": sig_header},
             )
-            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data.get("status"), "ignored_malformed_tenant_id")
 
     def test_stripe_valid_checkout_provisioning_hermetic(self):
         """Verifies that a valid checkout session provisions tenant storage in a temporary directory."""

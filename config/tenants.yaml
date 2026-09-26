@@ -1,10 +1,11 @@
 tenants:
-  - id: "tenant_curtains_001"
+  - tenant_id: "tenant_curtains_001"
     business_name: "Luxe Curtain Interiors"
-    owner_name: "Tariq Mansoor"
+    plan_tier: "pro"
+    subscription_status: "active"
     whatsapp_number: "+971501234567"
-    active_plan: "pro"
-    status: "active"
+    owner_phone: "+971501234567"
+    staff_phones: []
     website_url: "https://luxecurtains.example.com"
     target_keywords:
       - "custom curtains dubai"
@@ -16,12 +17,13 @@ tenants:
       - "memory_tree"
       - "seo_manager"
 
-  - id: "tenant_photo_002"
+  - tenant_id: "tenant_photo_002"
     business_name: "Apex Frame Photography"
-    owner_name: "Sarah Jenkins"
+    plan_tier: "starter"
+    subscription_status: "active"
     whatsapp_number: "+971509876543"
-    active_plan: "starter"
-    status: "active"
+    owner_phone: "+971509876543"
+    staff_phones: []
     website_url: "https://apexphoto.example.com"
     target_keywords:
       - "dubai wedding photographer"
@@ -30,12 +32,13 @@ tenants:
       - "research"
       - "memory_tree"
 
-  - id: "tenant_clean_003"
+  - tenant_id: "tenant_clean_003"
     business_name: "PureSpace Cleaning"
-    owner_name: "Dawit Bekele"
+    plan_tier: "pro"
+    subscription_status: "active"
     whatsapp_number: "+251911234567"
-    active_plan: "pro"
-    status: "active"
+    owner_phone: "+251911234567"
+    staff_phones: []
     website_url: "https://purespaceclean.example.com"
     target_keywords:
       - "home deep cleaning addis ababa"
@@ -44,3 +47,20 @@ tenants:
       - "invoicing"
       - "memory_tree"
       - "seo_manager"
+
+  - tenant_id: "tenant_photographer_001"
+    business_name: "Studio Prime Photography"
+    plan_tier: "pro"
+    subscription_status: "active"
+    whatsapp_number: "+971505554321"
+    owner_phone: "+971505554321"
+    staff_phones: []
+    stripe_customer_id: "cus_test_998811"
+    stripe_subscription_id: "sub_test_443322"
+    website_url: "https://studioprime.example.com"
+    target_keywords:
+      - "dubai commercial studio"
+    enabled_skills:
+      - "calendar_sync"
+      - "invoicing"
+      - "memory_tree"

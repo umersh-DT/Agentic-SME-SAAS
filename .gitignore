@@ -28,3 +28,6 @@ docker-compose.override.yml
 .coverage
 .vscode/
 .idea/
+
+# Runtime Data
+data/
