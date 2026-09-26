@@ -310,6 +310,78 @@ class TestGatewayWebhook(unittest.TestCase):
                 with open(temp_yaml, "r", encoding="utf-8") as f:
                     content = yaml.safe_load(f)
                     self.assertEqual(len(content.get("tenants", [])), 0)
+    def test_stripe_checkout_existing_tenant_updates_only_billing_and_preserves_attributes(self):
+        """Verifies that an existing tenant checkout updates only billing fields, preserving skills, name, and phones."""
+        ts = str(int(time.time()))
+        tenant_id = "tenant_curtains_001"
+        verified_phone = "+971501234567"  # Matches registered owner
+
+        payload = json.dumps({
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "customer": "cus_upgrade_999",
+                    "subscription": "sub_upgrade_888",
+                    "metadata": {
+                        "tenant_id": tenant_id,
+                        "business_name": "Wiped Name Ltd",  # Must NOT overwrite original
+                        "plan_tier": "enterprise",         # Must update
+                        "owner_phone": verified_phone,
+                    }
+                }
+            }
+        }).encode("utf-8")
+        sig = hmac.new(self.stripe_secret.encode("utf-8"), f"{ts}.".encode("utf-8") + payload, hashlib.sha256).hexdigest()
+
+        with patch.dict("os.environ", {"STRIPE_WEBHOOK_SECRET": self.stripe_secret}):
+            response = self.client.post(
+                "/webhook/stripe",
+                content=payload,
+                headers={"Stripe-Signature": f"t={ts},v1={sig}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json().get("status"), "success")
+
+            # Check that tenant was updated in directory
+            t_obj = tenant_directory.tenants[tenant_id]
+            self.assertEqual(t_obj.plan_tier, "enterprise")
+            self.assertEqual(t_obj.stripe_customer_id, "cus_upgrade_999")
+            # Crucial: Ensure custom attributes were NOT wiped
+            self.assertEqual(t_obj.business_name, "Luxe Curtain Interiors")
+            self.assertIn("seo_manager", t_obj.enabled_skills)
+
+    def test_stripe_checkout_existing_tenant_with_different_phone_rejected(self):
+        """Verifies that checkout for an existing tenant with a mismatched phone is rejected without taking over."""
+        ts = str(int(time.time()))
+        tenant_id = "tenant_curtains_001"
+        hijack_phone = "+971509990000"  # Does not match registered owner (+971501234567)
+
+        payload = json.dumps({
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "metadata": {
+                        "tenant_id": tenant_id,
+                        "business_name": "Luxe Curtain Interiors",
+                        "plan_tier": "enterprise",
+                        "owner_phone": hijack_phone,
+                    }
+                }
+            }
+        }).encode("utf-8")
+        sig = hmac.new(self.stripe_secret.encode("utf-8"), f"{ts}.".encode("utf-8") + payload, hashlib.sha256).hexdigest()
+
+        with patch.dict("os.environ", {"STRIPE_WEBHOOK_SECRET": self.stripe_secret}):
+            response = self.client.post(
+                "/webhook/stripe",
+                content=payload,
+                headers={"Stripe-Signature": f"t={ts},v1={sig}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json().get("status"), "ignored_phone_mismatch_for_existing_tenant")
+            # Original owner must remain intact
+            self.assertEqual(tenant_directory.resolve_sender("+971501234567"), tenant_id)
+            self.assertIsNone(tenant_directory.resolve_sender(hijack_phone))
 
 
 if __name__ == "__main__":

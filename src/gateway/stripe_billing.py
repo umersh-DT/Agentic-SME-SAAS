@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 from typing import Any, Dict, List, Optional
@@ -84,20 +85,31 @@ async def provision_tenant_storage(tenant_id: str, plan_tier: str = "starter", b
 
 
 def atomic_write_yaml(file_path: str, data: dict) -> None:
-    """Safely writes YAML data using an atomic replace operation."""
+    """Safely writes YAML data using an atomic replace operation and sets readable file permissions (0644)."""
     dir_name = os.path.dirname(os.path.abspath(file_path))
     os.makedirs(dir_name, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
         yaml.safe_dump(data, tf, sort_keys=False)
         temp_name = tf.name
+
+    # Ensure readable permissions across host and container (rw-r--r--)
+    try:
+        os.chmod(temp_name, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+    except OSError:
+        pass
+
     os.replace(temp_name, file_path)
 
 
 def register_tenant_in_yaml(
-    tenant_config: TenantConfig,
+    candidate_config: TenantConfig,
     config_path: str = "config/tenants.yaml",
 ) -> None:
-    """Atomically updates config/tenants.yaml with a pre-validated TenantConfig."""
+    """Atomically updates config/tenants.yaml.
+    
+    If tenant_id exists: updates ONLY billing metadata, preserving all business details and phone routing.
+    If tenant_id is new: appends the validated TenantConfig record.
+    """
     config_file = os.environ.get("TENANTS_CONFIG_PATH", config_path)
     data = {"tenants": []}
 
@@ -107,16 +119,22 @@ def register_tenant_in_yaml(
 
     tenants = data.get("tenants", [])
     found = False
-    new_entry = tenant_config.model_dump()
 
     for idx, t in enumerate(tenants):
-        if t.get("tenant_id") == tenant_config.tenant_id or t.get("id") == tenant_config.tenant_id:
-            tenants[idx] = new_entry
+        curr_id = t.get("tenant_id") or t.get("id")
+        if curr_id == candidate_config.tenant_id:
+            # Selective update of billing-only fields
+            t["plan_tier"] = candidate_config.plan_tier
+            t["subscription_status"] = "active"
+            if candidate_config.stripe_customer_id:
+                t["stripe_customer_id"] = candidate_config.stripe_customer_id
+            if candidate_config.stripe_subscription_id:
+                t["stripe_subscription_id"] = candidate_config.stripe_subscription_id
             found = True
             break
 
     if not found:
-        tenants.append(new_entry)
+        tenants.append(candidate_config.model_dump())
 
     data["tenants"] = tenants
     atomic_write_yaml(config_file, data)
@@ -176,7 +194,7 @@ async def handle_stripe_webhook(
             logger.warning(f"[STRIPE METADATA] Invalid plan_tier '{plan_tier}', defaulting to starter.")
             plan_tier = "starter"
 
-        # Validate TenantConfig IN MEMORY before writing to disk or YAML
+        # Validate in memory before touching storage or registry
         try:
             candidate_config = TenantConfig(
                 tenant_id=tenant_id,
@@ -191,24 +209,40 @@ async def handle_stripe_webhook(
                 enabled_skills=["calendar_sync", "invoicing", "research", "memory_tree"],
             )
         except Exception as e:
-            logger.error(f"[STRIPE CUSTOMER DEFECT] Invalid tenant configuration for {tenant_id}: {e}. Returning 200 to avoid retry loop.")
+            logger.error(f"[STRIPE CUSTOMER DEFECT] Invalid tenant configuration for {tenant_id}: {e}.")
             return Response(content=json.dumps({"status": "ignored_invalid_customer_data", "detail": str(e)}), media_type="application/json")
 
-        # Guard against Phone Collision / Account Hijacking
         from src.gateway.twilio_webhook import tenant_directory
-        norm_phone = candidate_config.owner_phone
-        existing_owner = tenant_directory.resolve_sender(norm_phone)
-        if existing_owner and existing_owner != tenant_id:
-            logger.critical(
-                f"[SECURITY HIJACK ATTEMPT] Phone {norm_phone} from checkout for {tenant_id} is already "
-                f"registered to active tenant {existing_owner}. Aborting registration to preserve existing tenant."
-            )
-            return Response(
-                content='{"status":"ignored_phone_already_registered"}',
-                media_type="application/json",
-            )
 
-        # Internal operational failures return 500 for retry
+        # CONDITION 1: If tenant_id already exists, prevent phone modification / hijacking
+        if tenant_id in tenant_directory.tenants:
+            existing_tenant = tenant_directory.tenants[tenant_id]
+            norm_checkout_phone = candidate_config.owner_phone
+            if norm_checkout_phone != existing_tenant.owner_phone and norm_checkout_phone != existing_tenant.whatsapp_number:
+                logger.critical(
+                    f"[SECURITY ACCOUNT HIJACK] Checkout for existing {tenant_id} provided phone "
+                    f"'{norm_checkout_phone}', which does not match registered owner phone '{existing_tenant.owner_phone}'. "
+                    f"Rejecting phone change to protect account routing."
+                )
+                return Response(
+                    content='{"status":"ignored_phone_mismatch_for_existing_tenant"}',
+                    media_type="application/json",
+                )
+        else:
+            # New tenant signup: Guard against collision with an existing tenant's number
+            norm_phone = candidate_config.owner_phone
+            existing_owner = tenant_directory.resolve_sender(norm_phone)
+            if existing_owner and existing_owner != tenant_id:
+                logger.critical(
+                    f"[SECURITY HIJACK ATTEMPT] Phone {norm_phone} for new {tenant_id} is already "
+                    f"registered to active tenant {existing_owner}. Aborting registration."
+                )
+                return Response(
+                    content='{"status":"ignored_phone_already_registered"}',
+                    media_type="application/json",
+                )
+
+        # Operational failures return 500 so Stripe retries
         try:
             base_dir = os.environ.get("TENANTS_DATA_DIR", "/app/data/tenants")
             await provision_tenant_storage(tenant_id=tenant_id, plan_tier=plan_tier, base_dir=base_dir)
