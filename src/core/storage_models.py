@@ -26,7 +26,7 @@ def load_default_settings(config_path: str = "config/default_settings.yaml") -> 
 
 
 class TenantDatabaseManager:
-    """Manages durability, conversation history, and token metering in tenant SQLite database."""
+    """Manages durability, conversation history, invoices, and token metering in tenant SQLite database."""
 
     def __init__(self, tenant_id: str, base_dir: str = "/app/data/tenants"):
         self.tenant_id = tenant_id
@@ -42,7 +42,7 @@ class TenantDatabaseManager:
         return conn
 
     def _init_tables(self) -> None:
-        """Initializes tables for durability, conversation memory, and token metering."""
+        """Initializes tables for durability, conversation memory, invoices, and token metering."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
@@ -59,22 +59,58 @@ class TenantDatabaseManager:
                 );
             """)
 
-            # 2. Rolling conversation history table (per-tenant session buffer)
+            # 2. Rolling conversation history table (per-tenant/sender session buffer)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_sid TEXT,
+                    from_number TEXT,
                     role TEXT NOT NULL, -- 'user', 'assistant', 'system'
                     content TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Schema migration check: ensure from_number exists if table was previously created
+            cursor.execute("PRAGMA table_info(conversation_history);")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "from_number" not in columns:
+                cursor.execute("ALTER TABLE conversation_history ADD COLUMN from_number TEXT;")
+
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_conv_history_created 
                 ON conversation_history(created_at);
             """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conv_history_sender 
+                ON conversation_history(from_number, id DESC);
+            """)
 
-            # 3. Token & monthly USD cost metering table
+            # 3. Invoice drafts persistence table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS invoices (
+                    invoice_number TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    client_name TEXT NOT NULL,
+                    client_contact TEXT,
+                    currency TEXT DEFAULT 'AED',
+                    subtotal REAL NOT NULL,
+                    tax_amount REAL NOT NULL,
+                    grand_total REAL NOT NULL,
+                    deposit_percentage REAL DEFAULT 0.0,
+                    required_deposit REAL DEFAULT 0.0,
+                    balance_due REAL DEFAULT 0.0,
+                    status TEXT DEFAULT 'draft',
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_invoices_created 
+                ON invoices(created_at);
+            """)
+
+            # 4. Token & monthly USD cost metering table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS token_usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,38 +175,112 @@ class TenantDatabaseManager:
 
     # --- Conversation History Operations ---
 
-    def _sync_get_recent_history(self, limit: int = 10) -> List[Dict[str, str]]:
+    def _sync_get_recent_history(
+        self, limit: int = 10, from_number: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT role, content 
-                FROM conversation_history 
-                ORDER BY id DESC 
-                LIMIT ?;
-                """,
-                (limit,),
-            )
+            if from_number:
+                cursor.execute(
+                    """
+                    SELECT role, content 
+                    FROM conversation_history 
+                    WHERE from_number = ?
+                    ORDER BY id DESC 
+                    LIMIT ?;
+                    """,
+                    (from_number, limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT role, content 
+                    FROM conversation_history 
+                    ORDER BY id DESC 
+                    LIMIT ?;
+                    """,
+                    (limit,),
+                )
             rows = cursor.fetchall()
             # Reverse to maintain chronological order [oldest ... newest]
             return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
-    async def get_recent_history(self, limit: int = 10) -> List[Dict[str, str]]:
-        return await asyncio.to_thread(self._sync_get_recent_history, limit)
+    async def get_recent_history(
+        self, limit: int = 10, from_number: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        return await asyncio.to_thread(self._sync_get_recent_history, limit, from_number)
 
-    def _sync_append_history(self, message_sid: str, role: str, content: str) -> None:
+    def _sync_append_history(
+        self,
+        message_sid: str,
+        role: str,
+        content: str,
+        from_number: Optional[str] = None,
+    ) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO conversation_history (message_sid, role, content)
-                VALUES (?, ?, ?);
+                INSERT INTO conversation_history (message_sid, from_number, role, content)
+                VALUES (?, ?, ?, ?);
                 """,
-                (message_sid, role, content),
+                (message_sid, from_number, role, content),
             )
             conn.commit()
 
-    async def append_history(self, message_sid: str, role: str, content: str) -> None:
-        await asyncio.to_thread(self._sync_append_history, message_sid, role, content)
+    async def append_history(
+        self,
+        message_sid: str,
+        role: str,
+        content: str,
+        from_number: Optional[str] = None,
+    ) -> None:
+        await asyncio.to_thread(self._sync_append_history, message_sid, role, content, from_number)
+
+    # --- Invoice Storage Operations ---
+
+    def _sync_save_invoice_draft(self, draft: Dict[str, Any]) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO invoices (
+                    invoice_number, tenant_id, client_name, client_contact,
+                    currency, subtotal, tax_amount, grand_total,
+                    deposit_percentage, required_deposit, balance_due,
+                    status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    draft["invoice_number"],
+                    draft["tenant_id"],
+                    draft["client_name"],
+                    draft.get("client_contact", ""),
+                    draft.get("currency", "AED"),
+                    float(draft["subtotal"]),
+                    float(draft["tax_amount"]),
+                    float(draft["grand_total"]),
+                    float(draft.get("deposit_percentage", 0.0)),
+                    float(draft.get("required_deposit", 0.0)),
+                    float(draft.get("balance_due", 0.0)),
+                    draft.get("status", "draft"),
+                    draft.get("notes"),
+                ),
+            )
+            conn.commit()
+
+    async def save_invoice_draft(self, draft: Dict[str, Any]) -> None:
+        """Persists generated invoice draft into tenant database."""
+        await asyncio.to_thread(self._sync_save_invoice_draft, draft)
+
+    def _sync_get_invoice(self, invoice_number: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM invoices WHERE invoice_number = ?;", (invoice_number,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_invoice(self, invoice_number: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single invoice by invoice number."""
+        return await asyncio.to_thread(self._sync_get_invoice, invoice_number)
 
     # --- Token Metering & USD Cost Cap Enforcement ---
 

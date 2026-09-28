@@ -46,6 +46,44 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIn("create_invoice", callables)
         self.assertIn("search_business_memory", callables)
 
+    async def test_create_invoice_tool_saves_draft_in_aed(self):
+        """Verifies create_invoice returns AED, contains 'draft', and persists record in SQLite."""
+        schema, callables = get_scoped_tools(tenant_id=self.tenant_id, base_data_dir=self.base_data_dir)
+        create_invoice_fn = callables["create_invoice"]
+
+        # Call scoped invoice tool callable directly
+        result = await create_invoice_fn(
+            customer_name="Ali Al-Maktoum",
+            amount=2500.00,
+            description="Custom Motorized Blackout Curtains",
+            deposit_percentage=50.0,
+            client_contact="+971509988776",
+        )
+
+        # 1. Verify currency is AED and status clearly states draft
+        self.assertIn("AED", result)
+        self.assertIn("draft", result.lower())
+        self.assertIn("Draft invoice — not sent to client", result)
+        self.assertIn("Ali Al-Maktoum", result)
+
+        # 2. Verify draft record is saved in tenant SQLite database
+        saved_draft = None
+        with self.db_manager._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM invoices WHERE client_name = ?;", ("Ali Al-Maktoum",))
+            row = cursor.fetchone()
+            if row:
+                saved_draft = dict(row)
+
+        self.assertIsNotNone(saved_draft, "Invoice draft was not saved in SQLite!")
+        self.assertEqual(saved_draft["currency"], "AED")
+        self.assertEqual(saved_draft["status"], "draft")
+        self.assertEqual(saved_draft["tenant_id"], self.tenant_id)
+        self.assertAlmostEqual(saved_draft["subtotal"], 2500.00)
+        self.assertAlmostEqual(saved_draft["tax_amount"], 125.00)  # 5% UAE VAT
+        self.assertAlmostEqual(saved_draft["grand_total"], 2625.00)
+        self.assertAlmostEqual(saved_draft["required_deposit"], 1312.50)  # 50% deposit
+
     async def test_agent_turn_with_invoice_tool_and_token_metering(self):
         """Simulates full LLM tool-calling cycle with LiteLLM mocked."""
         agent = LiteLLMAgent(
@@ -74,7 +112,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": "call_abc123",
                     "type": "function",
-                    "function": {"name": "create_invoice", "arguments": '{"customer_name": "Sarah Connor", "amount": 450.00}'},
+                    "function": {"name": "create_invoice", "arguments": '{"customer_name": "Sarah Connor", "amount": 450.00, "description": "Velvet Drapes"}'},
                 }
             ],
         }
@@ -84,10 +122,10 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         mock_resp_2 = MagicMock()
         mock_resp_2.choices = [MagicMock()]
         mock_resp_2.choices[0].message.tool_calls = None
-        mock_resp_2.choices[0].message.content = "I have generated an invoice of $450.00 for Sarah Connor."
+        mock_resp_2.choices[0].message.content = "Draft invoice generated for Sarah Connor in AED. Saved as draft — not sent."
         mock_resp_2.choices[0].message.to_dict.return_value = {
             "role": "assistant",
-            "content": "I have generated an invoice of $450.00 for Sarah Connor.",
+            "content": "Draft invoice generated for Sarah Connor in AED. Saved as draft — not sent.",
         }
         mock_resp_2.usage.prompt_tokens = 220
         mock_resp_2.usage.completion_tokens = 45
@@ -96,13 +134,22 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
             result = await agent.process_user_turn(
                 message_sid="SM_stage3_turn_1",
                 from_number="+971501234567",
-                user_message="Please create an invoice for Sarah Connor for $450",
+                user_message="Please create a draft invoice for Sarah Connor for 450 AED",
                 reply_skill=mock_reply_skill,
             )
 
         self.assertEqual(result["status"], "completed")
         self.assertIn("Sarah Connor", result["reply"])
         mock_reply_skill.send_reply.assert_called_once()
+
+        # Verify invoice draft was persisted to SQLite during the tool call
+        with self.db_manager._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM invoices WHERE client_name = ?;", ("Sarah Connor",))
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["currency"], "AED")
+            self.assertEqual(row["status"], "draft")
 
         # Verify token metering debited to SQLite
         spend = await self.db_manager.get_current_month_cost()
