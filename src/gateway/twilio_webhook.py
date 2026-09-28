@@ -7,9 +7,12 @@ import time
 from typing import Dict, Optional, Set
 from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Response
 import yaml
 
+from src.core.storage_models import TenantDatabaseManager, load_default_settings
+from src.gateway.dispatcher import TenantWorkerDispatcher
+from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.security import TenantConfig, normalize_phone_number
 
 logger = logging.getLogger("gateway_twilio")
@@ -37,8 +40,6 @@ class DeduplicationCache:
 
 
 class RejectionRateLimiter:
-    """Limits rejection TwiML to once per 24 hours (86,400 seconds) per sender to suppress spam."""
-
     def __init__(self, cooldown_seconds: int = 86400):
         self.cooldown = cooldown_seconds
         self._last_reply: Dict[str, float] = {}
@@ -61,6 +62,8 @@ class RejectionRateLimiter:
 
 dedup_cache = DeduplicationCache()
 rejection_limiter = RejectionRateLimiter(cooldown_seconds=86400)
+dispatcher = TenantWorkerDispatcher()
+reply_skill = WhatsAppReplySkill()
 
 
 class StrictTenantDirectory:
@@ -141,8 +144,10 @@ def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_tok
 @router.post("/whatsapp")
 async def handle_whatsapp_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
 ):
+    """Twilio WhatsApp Inbound Webhook handler."""
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 
     if not auth_token:
@@ -158,15 +163,19 @@ async def handle_whatsapp_webhook(
 
     form_params = dict(parse_qsl(raw_body.decode("utf-8", errors="ignore"), keep_blank_values=True))
     from_number = form_params.get("From", "")
+    body_text = form_params.get("Body", "").strip()
     message_sid = form_params.get("MessageSid", "")
+    num_media = int(form_params.get("NumMedia", "0"))
 
     if not message_sid:
         return Response(content="<Response></Response>", media_type="application/xml")
 
+    # 1. Deduplication Check
     if dedup_cache.is_duplicate(message_sid):
         logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
         return Response(content="<Response></Response>", media_type="application/xml", headers={"X-Dedup-Dropped": "true"})
 
+    # 2. Strict Sender Resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
         logger.warning(f"[ROUTING REJECT] Unregistered sender: {from_number}.")
@@ -181,5 +190,37 @@ async def handle_whatsapp_webhook(
             return Response(content=rejection_twiml, media_type="application/xml")
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    logger.info(f"[INGRESS ACCEPTED] MessageSid={message_sid} | Tenant={tenant_id} | Sender={from_number}")
+    tenant_config = tenant_directory.tenants[tenant_id]
+
+    # 3. Crash Replay Safety: Persist inbound message BEFORE acknowledging Twilio
+    base_data_dir = os.environ.get("TENANTS_DATA_DIR", "/app/data/tenants")
+    db_manager = TenantDatabaseManager(tenant_id=tenant_id, base_dir=base_data_dir)
+    await db_manager.persist_inbound_message(
+        message_sid=message_sid,
+        from_number=from_number,
+        body=body_text,
+        num_media=num_media,
+    )
+
+    # 4. Media-Only Message Intercept
+    if num_media > 0 and not body_text:
+        settings = load_default_settings()
+        media_msg = settings.get("whatsapp", {}).get(
+            "media_fallback_reply",
+            "Voice notes and media messages are coming soon! Please text your request for now.",
+        )
+        background_tasks.add_task(reply_skill.send_reply, to_number=from_number, message=media_msg)
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    # 5. Hand off to Agent Loop via BackgroundTasks
+    background_tasks.add_task(
+        dispatcher.process_incoming_message,
+        tenant_id=tenant_id,
+        plan_tier=tenant_config.plan_tier,
+        business_name=tenant_config.business_name,
+        from_number=from_number,
+        body=body_text,
+        message_sid=message_sid,
+    )
+
     return Response(content="<Response></Response>", media_type="application/xml")

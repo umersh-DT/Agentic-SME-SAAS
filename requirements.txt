@@ -34,3 +34,5 @@ stripe>=8.0.0
 aiosqlite>=0.20.0
 python-multipart>=0.0.9
 prometheus_client>=0.20.0
+litellm>=1.40.0
+twilio>=9.0.0

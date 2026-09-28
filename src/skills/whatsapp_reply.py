@@ -1,143 +1,125 @@
-import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 import httpx
 
-logger = logging.getLogger("whatsapp_reply")
+logger = logging.getLogger("whatsapp_reply_skill")
+
+
+def split_message_text(text: str, max_chars: int = 1550) -> List[str]:
+    """Splits text into chunks <= max_chars along paragraph or sentence boundaries."""
+    if not text or len(text) <= max_chars:
+        return [text] if text else []
+
+    chunks: List[str] = []
+    current_chunk = ""
+
+    paragraphs = text.split("\n\n")
+
+    for para in paragraphs:
+        if len(para) > max_chars:
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for s in sentences:
+                if len(current_chunk) + len(s) + 1 <= max_chars:
+                    current_chunk = f"{current_chunk} {s}".strip()
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                    if len(s) > max_chars:
+                        for i in range(0, len(s), max_chars):
+                            chunks.append(s[i : i + max_chars])
+                        current_chunk = ""
+                    else:
+                        current_chunk = s
+        else:
+            if len(current_chunk) + len(para) + 2 <= max_chars:
+                current_chunk = f"{current_chunk}\n\n{para}".strip()
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = para
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 
 class WhatsAppReplySkill:
-    """Sends outbound WhatsApp messages via the Twilio REST API.
-
-    Endpoint: POST https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Messages.json
-    """
+    """Dispatches outbound WhatsApp messages via Twilio REST API using httpx with automatic chunking."""
 
     def __init__(
         self,
         account_sid: Optional[str] = None,
         auth_token: Optional[str] = None,
-        default_sender: Optional[str] = None,
-        max_retries: int = 3,
-        timeout_seconds: float = 10.0,
-    ):
-        self.account_sid = account_sid or os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-        self.auth_token = auth_token or os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-        self.default_sender = default_sender or os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip()
-        self.max_retries = max_retries
-        self.timeout = timeout_seconds
-
-    def _normalize_whatsapp_number(self, number: str) -> str:
-        """Ensures phone number has the 'whatsapp:' prefix required by Twilio."""
-        cleaned = number.strip()
-        if not cleaned.startswith("whatsapp:"):
-            return f"whatsapp:{cleaned}"
-        return cleaned
-
-    @property
-    def api_url(self) -> str:
-        return f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
-
-    async def send_message(
-        self,
-        to_number: str,
-        body: str,
         from_number: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Sends an outbound WhatsApp text message with exponential backoff on retries."""
+        default_sender: Optional[str] = None,
+    ):
+        self.account_sid = (account_sid or os.getenv("TWILIO_ACCOUNT_SID", "")).strip()
+        self.auth_token = (auth_token or os.getenv("TWILIO_AUTH_TOKEN", "")).strip()
+        raw_sender = default_sender or from_number or os.getenv("TWILIO_WHATSAPP_NUMBER", "+14155238886")
+        self.from_number = self._normalize_whatsapp_number(raw_sender)
+
+    def _normalize_whatsapp_number(self, phone: str) -> str:
+        if not phone:
+            return ""
+        cleaned = phone.strip()
+        return cleaned if cleaned.startswith("whatsapp:") else f"whatsapp:{cleaned}"
+
+    async def send_reply(self, to_number: str, message: str) -> Dict[str, Any]:
+        """Alias for send_message matching Stage 3 dispatcher interface."""
+        return await self.send_message(to_number=to_number, body=message)
+
+    async def send_message(self, to_number: str, body: str) -> Dict[str, Any]:
+        """Dispatches outbound WhatsApp message chunks via Twilio REST API."""
         if not self.account_sid or not self.auth_token:
-            logger.error("Twilio credentials missing: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not configured.")
+            logger.warning("Twilio credentials missing: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not configured.")
             return {
                 "success": False,
                 "error": "TWILIO_CREDENTIALS_MISSING",
-                "details": "Account SID or Auth Token is unset.",
+                "message": body,
             }
 
-        sender = from_number or self.default_sender
-        if not sender:
-            logger.error("Outbound sender phone number missing.")
-            return {
-                "success": False,
-                "error": "SENDER_NUMBER_MISSING",
-                "details": "No 'from_number' provided and TWILIO_WHATSAPP_NUMBER is unset.",
-            }
+        target_to = self._normalize_whatsapp_number(to_number)
+        target_from = self.from_number
+        chunks = split_message_text(body, max_chars=1550)
 
-        normalized_to = self._normalize_whatsapp_number(to_number)
-        normalized_from = self._normalize_whatsapp_number(sender)
-
-        payload = {
-            "To": normalized_to,
-            "From": normalized_from,
-            "Body": body,
-        }
-
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
         auth = (self.account_sid, self.auth_token)
-        delay = 1.0
+        last_sid = ""
+        sent_sids: List[str] = []
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(
-                        self.api_url,
-                        data=payload,
-                        auth=auth,
-                    )
-
-                if response.status_code in (200, 201):
-                    res_data = response.json()
-                    sid = res_data.get("sid", "")
-                    logger.info(
-                        f"[OUTBOUND SUCCESS] WhatsApp sent to {normalized_to} | "
-                        f"SID={sid} | Status={res_data.get('status')}"
-                    )
-                    return {
-                        "success": True,
-                        "message_sid": sid,
-                        "status": res_data.get("status"),
-                        "to": normalized_to,
-                        "from": normalized_from,
-                    }
-
-                # Retry on rate limits (429) or transient gateway errors (5xx)
-                if response.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                    logger.warning(
-                        f"[OUTBOUND RETRY] Twilio API HTTP {response.status_code}. "
-                        f"Attempt {attempt}/{self.max_retries}. Retrying in {delay}s..."
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
-
-                error_data = (
-                    response.json()
-                    if response.headers.get("content-type", "").startswith("application/json")
-                    else {"text": response.text}
-                )
-                logger.error(f"[OUTBOUND ERROR] Twilio HTTP {response.status_code}: {error_data}")
-                return {
-                    "success": False,
-                    "http_status": response.status_code,
-                    "error": error_data.get("message", "Twilio API transmission failure"),
-                    "code": error_data.get("code"),
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for idx, chunk in enumerate(chunks):
+                data = {
+                    "To": target_to,
+                    "From": target_from,
+                    "Body": chunk,
                 }
-
-            except (httpx.RequestError, httpx.TimeoutException) as exc:
-                if attempt < self.max_retries:
-                    logger.warning(
-                        f"[OUTBOUND NETWORK ERROR] {type(exc).__name__}: {exc}. "
-                        f"Attempt {attempt}/{self.max_retries}. Retrying in {delay}s..."
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error(f"[OUTBOUND FAILED] All {self.max_retries} attempts failed: {exc}")
-                    return {
-                        "success": False,
-                        "error": "NETWORK_ERROR",
-                        "details": str(exc),
-                    }
+                try:
+                    resp = await client.post(url, data=data, auth=auth)
+                    if resp.status_code in (200, 201):
+                        resp_data = resp.json()
+                        sid = resp_data.get("sid", f"SM_mock_{idx}")
+                        last_sid = sid
+                        sent_sids.append(sid)
+                    else:
+                        logger.error(f"[TWILIO REST ERROR] Status {resp.status_code}: {resp.text}")
+                        return {
+                            "success": False,
+                            "error": f"Twilio API error {resp.status_code}",
+                            "details": resp.text,
+                        }
+                except Exception as e:
+                    logger.error(f"[TWILIO DISPATCH FAILED] {e}")
+                    return {"success": False, "error": str(e)}
 
         return {
-            "success": False,
-            "error": "MAX_RETRIES_EXCEEDED",
+            "success": True,
+            "message_sid": last_sid,
+            "to": target_to,
+            "from": target_from,
+            "chunks_sent": sent_sids,
+            "total_chunks": len(chunks),
         }

@@ -1,0 +1,24 @@
+# Stage 3 Global Configuration: LiteLLM Agent Loop, Token Metering & Guardrails
+
+llm:
+  model: "openai/gpt-4o-mini"
+  temperature: 0.2
+  max_tokens: 800
+  timeout_seconds: 25
+  max_tool_rounds: 4
+
+quotas_usd_monthly:
+  starter: 5.00
+  pro: 20.00
+  enterprise: 100.00
+
+# Pricing in USD per 1M tokens (e.g. gpt-4o-mini rates)
+pricing_per_1m_tokens:
+  prompt_usd: 0.150
+  completion_usd: 0.600
+
+whatsapp:
+  max_message_chars: 1550
+  media_fallback_reply: "Voice notes and media messages are coming soon! Please text your request for now."
+  error_fallback_reply: "I'm having trouble processing that request right now. Please try again in a moment."
+  history_limit: 10
