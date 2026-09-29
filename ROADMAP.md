@@ -34,9 +34,10 @@
 - [x] Hermetic automated test suite (21/21 passing, clean unmocked directory tests)
 - **Status:** Complete & Remediated (Ready for Final Sign-Off)
 
-## Stage 3: Agentic Core & Business Skill Pipeline [NEXT]
-- [ ] LiteLLM integration with single model provider
-- [ ] Per-tenant token metering and usage limits
-- [ ] Context extractor & dynamic tool calling
-- [ ] Memory tree FTS5 search & CRM state tracking
-- [ ] Uvicorn reverse-proxy headers (`--proxy-headers --forwarded-allow-ips=*`)
+### Phase 3: Conversational Intelligence & Memory Core [DONE]
+- [x] Ingress Webhook Hardening: HMAC SHA-1 signature verification with `keep_blank_values=True`, in-memory deduplication cache, and strict tenant phone isolation.
+- [x] Webhook Durability & Startup Replay: Webhook-first SQLite persistence, automated crash recovery reset (`processing` -> `pending`), and startup replay via FastAPI lifespan.
+- [x] Per-Sender History Isolation: Isolated rolling conversation history partitioned by sender phone number.
+- [x] Database-Backed Sequential Invoicing: Sequential draft invoice numbering (`1001`, `1002`, etc.) in AED with 5% VAT, persisted with plain `INSERT`.
+- [x] Token Metering & Platform Alerts: Real token tracking against monthly USD caps, with single-cadence platform owner alerts (`platform_alerts` table).
+- [x] Media-Only Intercept: Non-text/voice-note advisory intercept with automatic status completion.

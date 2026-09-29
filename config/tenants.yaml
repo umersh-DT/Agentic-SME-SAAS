@@ -1,64 +1,63 @@
 tenants:
-  - tenant_id: "tenant_curtains_001"
-    business_name: "Luxe Curtain Interiors"
-    plan_tier: "pro"
-    subscription_status: "active"
-    whatsapp_number: "+971501234567"
-    owner_phone: "+971501234567"
-    staff_phones: []
-    website_url: "https://luxecurtains.example.com"
-    target_keywords:
-      - "custom curtains dubai"
-      - "motorized blackout shades"
-    enabled_skills:
-      - "calendar_sync"
-      - "invoicing"
-      - "research"
-      - "memory_tree"
-      - "seo_manager"
-
-  - tenant_id: "tenant_photo_002"
-    business_name: "Apex Frame Photography"
-    plan_tier: "starter"
-    subscription_status: "active"
-    whatsapp_number: "+971509876543"
-    owner_phone: "+971509876543"
-    staff_phones: []
-    website_url: "https://apexphoto.example.com"
-    target_keywords:
-      - "dubai wedding photographer"
-    enabled_skills:
-      - "calendar_sync"
-      - "research"
-      - "memory_tree"
-
-  - tenant_id: "tenant_clean_003"
-    business_name: "PureSpace Cleaning"
-    plan_tier: "pro"
-    subscription_status: "active"
-    whatsapp_number: "+251911234567"
-    owner_phone: "+251911234567"
-    staff_phones: []
-    website_url: "https://purespaceclean.example.com"
-    target_keywords:
-      - "home deep cleaning addis ababa"
-    enabled_skills:
-      - "calendar_sync"
-      - "invoicing"
-      - "memory_tree"
-      - "seo_manager"
-
-  - tenant_id: "tenant_photographer_001"
-    business_name: "Studio Prime Photography"
-    plan_tier: "pro"
-    subscription_status: "active"
-    whatsapp_number: "+971505554321"
-    owner_phone: "+971505554321"
-    staff_phones: []
-    website_url: "https://studioprime.example.com"
-    target_keywords:
-      - "dubai commercial studio"
-    enabled_skills:
-      - "calendar_sync"
-      - "invoicing"
-      - "memory_tree"
+- tenant_id: tenant_curtains_001
+  business_name: Luxe Curtain Interiors
+  plan_tier: enterprise
+  subscription_status: active
+  whatsapp_number: '+971501234567'
+  owner_phone: '+971501234567'
+  staff_phones: []
+  website_url: https://luxecurtains.example.com
+  target_keywords:
+  - custom curtains dubai
+  - motorized blackout shades
+  enabled_skills:
+  - calendar_sync
+  - invoicing
+  - research
+  - memory_tree
+  - seo_manager
+  stripe_customer_id: cus_upgrade_999
+  stripe_subscription_id: sub_upgrade_888
+- tenant_id: tenant_photo_002
+  business_name: Apex Frame Photography
+  plan_tier: starter
+  subscription_status: active
+  whatsapp_number: '+971509876543'
+  owner_phone: '+971509876543'
+  staff_phones: []
+  website_url: https://apexphoto.example.com
+  target_keywords:
+  - dubai wedding photographer
+  enabled_skills:
+  - calendar_sync
+  - research
+  - memory_tree
+- tenant_id: tenant_clean_003
+  business_name: PureSpace Cleaning
+  plan_tier: pro
+  subscription_status: active
+  whatsapp_number: '+251911234567'
+  owner_phone: '+251911234567'
+  staff_phones: []
+  website_url: https://purespaceclean.example.com
+  target_keywords:
+  - home deep cleaning addis ababa
+  enabled_skills:
+  - calendar_sync
+  - invoicing
+  - memory_tree
+  - seo_manager
+- tenant_id: tenant_photographer_001
+  business_name: Studio Prime Photography
+  plan_tier: pro
+  subscription_status: active
+  whatsapp_number: '+971505554321'
+  owner_phone: '+971505554321'
+  staff_phones: []
+  website_url: https://studioprime.example.com
+  target_keywords:
+  - dubai commercial studio
+  enabled_skills:
+  - calendar_sync
+  - invoicing
+  - memory_tree

@@ -1,81 +1,28 @@
-networks:
-  agentic_network:
-    driver: bridge
-
 services:
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: agentic_nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ../data/certbot/conf:/etc/letsencrypt
-      - ../data/certbot/www:/var/www/certbot
-    networks:
-      - agentic_network
-    depends_on:
-      - agentic_gateway
-
-  certbot:
-    image: certbot/certbot:v2.11.0
-    container_name: agentic_certbot
-    restart: unless-stopped
-    volumes:
-      - ../data/certbot/conf:/etc/letsencrypt
-      - ../data/certbot/www:/var/www/certbot
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
-
-  agentic_gateway:
+  gateway:
     build:
       context: ..
       dockerfile: docker/Dockerfile.core
-    container_name: agentic_gateway
+    image: docker-tenant_worker:latest
+    container_name: agentic_sme_gateway
     restart: unless-stopped
-    expose:
-      - "8000"
+    command: uvicorn src.gateway.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
     environment:
       - PYTHONPATH=/app
-      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
-      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
-      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
+      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:-+14155238886}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - PLATFORM_ALERT_WHATSAPP=${PLATFORM_ALERT_WHATSAPP:-}
+      - TENANTS_CONFIG_PATH=/app/config/tenants.yaml
+      - TENANTS_DATA_DIR=/app/data/tenants
     volumes:
-      - ../data/tenants:/app/data/tenants
-      - ../config:/app/config
-    networks:
-      - agentic_network
-    command: ["uvicorn", "src.gateway.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*", "--workers", "1"]
+      - ..:/app
+      - tenant_data:/app/data/tenants
 
-  prometheus:
-    image: prom/prometheus:v2.54.1
-    container_name: agentic_prometheus
-    restart: unless-stopped
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    expose:
-      - "9090"
-    networks:
-      - agentic_network
-
-  grafana:
-    image: grafana/grafana:11.2.0
-    container_name: agentic_grafana
-    restart: unless-stopped
-    expose:
-      - "3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in .env}
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - ../data/grafana:/var/lib/grafana
-    networks:
-      - agentic_network
-    depends_on:
-      - prometheus
+volumes:
+  tenant_data:

@@ -38,3 +38,12 @@
 - Canned customer autoreply removed from `dispatcher.py`.
 - Rate-limited graceful rejection for unregistered senders via TwiML.
 - Unit test suite expanded to 19 hermetic tests covering unmocked directory routing, collision rejection, and isolated temporary directories.
+
+## Current Status: Stage 3 Finalized & Audit-Ready
+
+### Completed Capabilities (Stage 3):
+1. **Crash Durability & Replay:** Inbound messages persist to SQLite before HTTP 200 acknowledgment. Containers reset interrupted `processing` turns on boot and replay them through `replay_pending_messages()`.
+2. **Strict Sender Isolation:** Multi-user tenant interactions partition history strictly by phone number to prevent cross-user data leakage.
+3. **Draft Invoicing:** Invoices generate with tenant-scoped sequential numbers and 5% VAT calculation in AED, saved as review-only drafts without customer dispatch.
+4. **Token Usage & Quota Safeguards:** Token consumption is recorded from real LLM provider usage headers, triggering tenant caps and once-a-month platform alerts.
+5. **Ingress Security:** Twilio and Stripe endpoints enforce HMAC signature validation, path-traversal prevention, and customer phone collision rejection.

@@ -26,7 +26,7 @@ def load_default_settings(config_path: str = "config/default_settings.yaml") -> 
 
 
 class TenantDatabaseManager:
-    """Manages durability, conversation history, invoices, and token metering in tenant SQLite database."""
+    """Manages durability, conversation history, invoices, platform alerts, and token metering in tenant SQLite database."""
 
     def __init__(self, tenant_id: str, base_dir: str = "/app/data/tenants"):
         self.tenant_id = tenant_id
@@ -42,7 +42,7 @@ class TenantDatabaseManager:
         return conn
 
     def _init_tables(self) -> None:
-        """Initializes tables for durability, conversation memory, invoices, and token metering."""
+        """Initializes tables for durability, conversation memory, invoices, token metering, and platform alerts."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
@@ -126,6 +126,20 @@ class TenantDatabaseManager:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_token_usage_created 
                 ON token_usage(created_at);
+            """)
+
+            # 5. Platform alert cadence tracking table (Fix 1)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS platform_alerts (
+                    alert_type TEXT NOT NULL,
+                    period TEXT NOT NULL,          -- e.g. '2026-09'
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (alert_type, period)
+                );
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_platform_alerts_period 
+                ON platform_alerts(period);
             """)
             conn.commit()
 
@@ -388,3 +402,39 @@ class TenantDatabaseManager:
         max_quota = float(quotas.get(plan_tier, quotas.get("starter", 5.0)))
         current_spend = await self.get_current_month_cost()
         return (current_spend >= max_quota, current_spend, max_quota)
+
+    # --- Platform Alert Cadence Operations (Fix 1) ---
+
+    def _period(self) -> str:
+        """Returns the current UTC year and month (e.g. '2026-09')."""
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _sync_has_alerted_this_month(self, alert_type: str = "quota") -> bool:
+        period = self._period()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM platform_alerts WHERE alert_type = ? AND period = ?;",
+                (alert_type, period),
+            )
+            return cursor.fetchone() is not None
+
+    async def has_alerted_this_month(self, alert_type: str = "quota") -> bool:
+        """Checks if a platform alert for the specified type has already been recorded this month."""
+        return await asyncio.to_thread(self._sync_has_alerted_this_month, alert_type)
+
+    def _sync_record_monthly_alert(self, alert_type: str = "quota") -> None:
+        period = self._period()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO platform_alerts (alert_type, period)
+                VALUES (?, ?);
+                """,
+                (alert_type, period),
+            )
+            conn.commit()
+
+    async def record_monthly_alert(self, alert_type: str = "quota") -> None:
+        """Records a sent platform alert for the current calendar month."""
+        await asyncio.to_thread(self._sync_record_monthly_alert, alert_type)

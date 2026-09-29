@@ -46,7 +46,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIn("search_business_memory", callables)
 
     async def test_consecutive_invoices_increment_numbers_and_persist_both(self):
-        """Bug 2.2 Fix Verification: Generates two invoices and verifies unique numbers and 2 distinct rows."""
+        """Generates two invoices and verifies unique numbers and 2 distinct rows in SQLite."""
         schema, callables = get_scoped_tools(tenant_id=self.tenant_id, base_data_dir=self.base_data_dir)
         create_invoice_fn = callables["create_invoice"]
 
@@ -72,20 +72,77 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AED", res2)
         self.assertIn("Draft invoice — not sent to client", res2)
 
-        # 3. Query SQLite to verify two separate rows exist
         with self.db_manager._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT invoice_number, client_name, grand_total, status FROM invoices ORDER BY invoice_number ASC;")
             rows = [dict(r) for r in cursor.fetchall()]
 
-        self.assertEqual(len(rows), 2, "Expected exactly 2 invoice drafts saved, but found a different count (overwrite detected)!")
-        
-        # Verify numbers increment and are unique
+        self.assertEqual(len(rows), 2)
         self.assertNotEqual(rows[0]["invoice_number"], rows[1]["invoice_number"])
         self.assertEqual(rows[0]["client_name"], "Ali Al-Maktoum")
         self.assertEqual(rows[1]["client_name"], "Sara Connor")
         self.assertTrue(rows[0]["invoice_number"].endswith("1001"))
         self.assertTrue(rows[1]["invoice_number"].endswith("1002"))
+
+    async def test_quota_alert_sent_exactly_once_per_month(self):
+        """Fix 1: Two over-quota turns in the same month trigger exactly one platform alert[cite: 9]."""
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="starter",  # $5.00 monthly cap
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+
+        # Pre-seed token_usage table with spend exceeding the $5.00 starter cap ($5.20 spent)
+        with self.db_manager._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO token_usage (message_sid, model, prompt_tokens, completion_tokens, total_tokens, cost_usd)
+                VALUES ('SM_seed_spend', 'openai/gpt-4o-mini', 10000, 5000, 15000, 5.20);
+                """
+            )
+            conn.commit()
+
+        mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
+        mock_reply_skill.send_reply = AsyncMock(
+            return_value={"success": True, "message_sid": "SM_alert_test"}
+        )
+
+        with patch.dict("os.environ", {"PLATFORM_ALERT_WHATSAPP": "+971509990000"}):
+            # Turn 1: Quota exceeded -> should send user cap notice AND platform alert
+            res1 = await agent.process_user_turn(
+                message_sid="SM_over_quota_turn_1",
+                from_number="+971501234567",
+                user_message="Hello assistant",
+                reply_skill=mock_reply_skill,
+            )
+            self.assertEqual(res1["status"], "quota_exceeded")
+            
+            # send_reply called twice: once to user (+971501234567), once to platform (+971509990000)
+            self.assertEqual(mock_reply_skill.send_reply.call_count, 2)
+            called_recipients = [call.kwargs.get("to_number") for call in mock_reply_skill.send_reply.call_args_list]
+            self.assertIn("+971509990000", called_recipients)
+
+            # Turn 2: Second over-quota turn in same month -> should notify user but NOT alert platform again
+            mock_reply_skill.send_reply.reset_mock()
+            res2 = await agent.process_user_turn(
+                message_sid="SM_over_quota_turn_2",
+                from_number="+971501234567",
+                user_message="Hello again",
+                reply_skill=mock_reply_skill,
+            )
+            self.assertEqual(res2["status"], "quota_exceeded")
+            
+            # send_reply called only ONCE (to the user), platform alert was skipped
+            self.assertEqual(mock_reply_skill.send_reply.call_count, 1)
+            self.assertEqual(mock_reply_skill.send_reply.call_args.kwargs.get("to_number"), "+971501234567")
+
+            # Verify platform_alerts table has exactly 1 row
+            with self.db_manager._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT alert_type, period FROM platform_alerts WHERE alert_type = 'quota';")
+                rows = cursor.fetchall()
+                self.assertEqual(len(rows), 1)
 
     async def test_agent_turn_with_invoice_tool_and_token_metering(self):
         """Simulates full LLM tool turn with real WhatsAppReplySkill return shape."""
@@ -142,12 +199,10 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
                 reply_skill=mock_reply_skill,
             )
 
-        # Bug 2.1 check: Send returned {"success": True}, so message must be 'completed'
         self.assertEqual(result["status"], "completed")
         self.assertIn("Sarah Connor", result["reply"])
         mock_reply_skill.send_reply.assert_called_once()
 
-        # Verify status in database is completed
         with self.db_manager._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT status FROM inbound_messages WHERE message_sid = ?;", ("SM_stage3_turn_1",))
@@ -155,7 +210,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["status"], "completed")
 
     async def test_agent_turn_failed_send_marks_message_failed(self):
-        """Bug 2.1 Check: Verifies that when WhatsApp send fails, message status is 'failed'."""
+        """Verifies that when WhatsApp send fails, message status is 'failed'."""
         agent = LiteLLMAgent(
             tenant_id=self.tenant_id,
             plan_tier="pro",
@@ -192,17 +247,9 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
 
     async def test_sender_history_isolation(self):
         """Verifies conversation history is isolated per sender phone number."""
-        agent = LiteLLMAgent(
-            tenant_id=self.tenant_id,
-            plan_tier="pro",
-            business_name="Luxe Curtain Interiors",
-            base_data_dir=self.base_data_dir,
-        )
-
         sender_owner = "+971501111111"
         sender_staff = "+971502222222"
 
-        # Owner adds a message
         await self.db_manager.append_history(
             message_sid="SM_owner_1",
             from_number=sender_owner,
@@ -210,11 +257,9 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
             content="Owner private financial update: profit margin is 45%",
         )
 
-        # Staff queries recent history
         staff_history = await self.db_manager.get_recent_history(limit=10, from_number=sender_staff)
-        self.assertEqual(len(staff_history), 0, "Staff history should be empty and not contain owner turns!")
+        self.assertEqual(len(staff_history), 0)
 
-        # Owner queries recent history
         owner_history = await self.db_manager.get_recent_history(limit=10, from_number=sender_owner)
         self.assertEqual(len(owner_history), 1)
         self.assertIn("Owner private", owner_history[0]["content"])
@@ -233,7 +278,6 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
             return_value={"success": True, "message_sid": "SM_tool_cap"}
         )
 
-        # Simulate repetitive tool call loop exceeding max rounds
         tool_call_obj = MagicMock()
         tool_call_obj.id = "call_loop"
         tool_call_obj.function.name = "search_business_memory"
@@ -261,7 +305,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reply"], "I couldn't complete that request. Please try rephrasing.")
 
     async def test_auth_error_triggers_fallback_with_zero_token_billing(self):
-        """Verifies auth/API errors trigger standard fallback and bill 0 tokens (no fake 75/25 tokens)."""
+        """Verifies auth/API errors trigger standard fallback and bill 0 tokens."""
         agent = LiteLLMAgent(
             tenant_id=self.tenant_id,
             plan_tier="starter",
@@ -282,10 +326,9 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
                 reply_skill=mock_reply_skill,
             )
 
-        # Verify fallback message was sent and 0 billable tokens recorded
         self.assertIn("having trouble processing that request", result["reply"])
         spend = await self.db_manager.get_current_month_cost()
-        self.assertEqual(spend, 0.0, "Auth error should not bill any tokens to the tenant database!")
+        self.assertEqual(spend, 0.0)
 
 
 if __name__ == "__main__":
