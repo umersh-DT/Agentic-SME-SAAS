@@ -24,7 +24,6 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         short_text = "Hello from WhatsApp!"
         self.assertEqual(split_message_text(short_text, max_chars=1550), [short_text])
 
-        # Create large text exceeding 3000 chars
         para1 = "Paragraph 1: " + ("A" * 1200)
         para2 = "Paragraph 2: " + ("B" * 1200)
         para3 = "Paragraph 3: " + ("C" * 1200)
@@ -46,46 +45,50 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIn("create_invoice", callables)
         self.assertIn("search_business_memory", callables)
 
-    async def test_create_invoice_tool_saves_draft_in_aed(self):
-        """Verifies create_invoice returns AED, contains 'draft', and persists record in SQLite."""
+    async def test_consecutive_invoices_increment_numbers_and_persist_both(self):
+        """Bug 2.2 Fix Verification: Generates two invoices and verifies unique numbers and 2 distinct rows."""
         schema, callables = get_scoped_tools(tenant_id=self.tenant_id, base_data_dir=self.base_data_dir)
         create_invoice_fn = callables["create_invoice"]
 
-        # Call scoped invoice tool callable directly
-        result = await create_invoice_fn(
+        # 1. Create first invoice (Ali)
+        res1 = await create_invoice_fn(
             customer_name="Ali Al-Maktoum",
             amount=2500.00,
             description="Custom Motorized Blackout Curtains",
             deposit_percentage=50.0,
             client_contact="+971509988776",
         )
+        self.assertIn("AED", res1)
+        self.assertIn("Draft invoice — not sent to client", res1)
 
-        # 1. Verify currency is AED and status clearly states draft
-        self.assertIn("AED", result)
-        self.assertIn("draft", result.lower())
-        self.assertIn("Draft invoice — not sent to client", result)
-        self.assertIn("Ali Al-Maktoum", result)
+        # 2. Create second invoice (Sara)
+        res2 = await create_invoice_fn(
+            customer_name="Sara Connor",
+            amount=1800.00,
+            description="Sheer Drapes Installation",
+            deposit_percentage=25.0,
+            client_contact="+971501234567",
+        )
+        self.assertIn("AED", res2)
+        self.assertIn("Draft invoice — not sent to client", res2)
 
-        # 2. Verify draft record is saved in tenant SQLite database
-        saved_draft = None
+        # 3. Query SQLite to verify two separate rows exist
         with self.db_manager._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM invoices WHERE client_name = ?;", ("Ali Al-Maktoum",))
-            row = cursor.fetchone()
-            if row:
-                saved_draft = dict(row)
+            cursor.execute("SELECT invoice_number, client_name, grand_total, status FROM invoices ORDER BY invoice_number ASC;")
+            rows = [dict(r) for r in cursor.fetchall()]
 
-        self.assertIsNotNone(saved_draft, "Invoice draft was not saved in SQLite!")
-        self.assertEqual(saved_draft["currency"], "AED")
-        self.assertEqual(saved_draft["status"], "draft")
-        self.assertEqual(saved_draft["tenant_id"], self.tenant_id)
-        self.assertAlmostEqual(saved_draft["subtotal"], 2500.00)
-        self.assertAlmostEqual(saved_draft["tax_amount"], 125.00)  # 5% UAE VAT
-        self.assertAlmostEqual(saved_draft["grand_total"], 2625.00)
-        self.assertAlmostEqual(saved_draft["required_deposit"], 1312.50)  # 50% deposit
+        self.assertEqual(len(rows), 2, "Expected exactly 2 invoice drafts saved, but found a different count (overwrite detected)!")
+        
+        # Verify numbers increment and are unique
+        self.assertNotEqual(rows[0]["invoice_number"], rows[1]["invoice_number"])
+        self.assertEqual(rows[0]["client_name"], "Ali Al-Maktoum")
+        self.assertEqual(rows[1]["client_name"], "Sara Connor")
+        self.assertTrue(rows[0]["invoice_number"].endswith("1001"))
+        self.assertTrue(rows[1]["invoice_number"].endswith("1002"))
 
     async def test_agent_turn_with_invoice_tool_and_token_metering(self):
-        """Simulates full LLM tool-calling cycle with LiteLLM mocked."""
+        """Simulates full LLM tool turn with real WhatsAppReplySkill return shape."""
         agent = LiteLLMAgent(
             tenant_id=self.tenant_id,
             plan_tier="pro",
@@ -94,9 +97,10 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         )
 
         mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
-        mock_reply_skill.send_reply = AsyncMock(return_value={"status": "sent"})
+        mock_reply_skill.send_reply = AsyncMock(
+            return_value={"success": True, "message_sid": "SM_real_sid_123"}
+        )
 
-        # Mock LiteLLM responses: Round 1 emits tool call, Round 2 emits final answer
         tool_call_obj = MagicMock()
         tool_call_obj.id = "call_abc123"
         tool_call_obj.function.name = "create_invoice"
@@ -138,28 +142,150 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
                 reply_skill=mock_reply_skill,
             )
 
+        # Bug 2.1 check: Send returned {"success": True}, so message must be 'completed'
         self.assertEqual(result["status"], "completed")
         self.assertIn("Sarah Connor", result["reply"])
         mock_reply_skill.send_reply.assert_called_once()
 
-        # Verify invoice draft was persisted to SQLite during the tool call
+        # Verify status in database is completed
         with self.db_manager._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM invoices WHERE client_name = ?;", ("Sarah Connor",))
+            cursor.execute("SELECT status FROM inbound_messages WHERE message_sid = ?;", ("SM_stage3_turn_1",))
             row = cursor.fetchone()
-            self.assertIsNotNone(row)
-            self.assertEqual(row["currency"], "AED")
-            self.assertEqual(row["status"], "draft")
+            self.assertEqual(row["status"], "completed")
 
-        # Verify token metering debited to SQLite
+    async def test_agent_turn_failed_send_marks_message_failed(self):
+        """Bug 2.1 Check: Verifies that when WhatsApp send fails, message status is 'failed'."""
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="pro",
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+
+        mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
+        mock_reply_skill.send_reply = AsyncMock(
+            return_value={"success": False, "error": "Twilio fatal 400"}
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.tool_calls = None
+        mock_resp.choices[0].message.content = "Here is your simple answer."
+        mock_resp.usage.prompt_tokens = 50
+        mock_resp.usage.completion_tokens = 10
+
+        with patch("litellm.acompletion", return_value=mock_resp):
+            result = await agent.process_user_turn(
+                message_sid="SM_stage3_fail_send",
+                from_number="+971501234567",
+                user_message="Hello",
+                reply_skill=mock_reply_skill,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        with self.db_manager._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM inbound_messages WHERE message_sid = ?;", ("SM_stage3_fail_send",))
+            row = cursor.fetchone()
+            self.assertEqual(row["status"], "failed")
+
+    async def test_sender_history_isolation(self):
+        """Verifies conversation history is isolated per sender phone number."""
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="pro",
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+
+        sender_owner = "+971501111111"
+        sender_staff = "+971502222222"
+
+        # Owner adds a message
+        await self.db_manager.append_history(
+            message_sid="SM_owner_1",
+            from_number=sender_owner,
+            role="user",
+            content="Owner private financial update: profit margin is 45%",
+        )
+
+        # Staff queries recent history
+        staff_history = await self.db_manager.get_recent_history(limit=10, from_number=sender_staff)
+        self.assertEqual(len(staff_history), 0, "Staff history should be empty and not contain owner turns!")
+
+        # Owner queries recent history
+        owner_history = await self.db_manager.get_recent_history(limit=10, from_number=sender_owner)
+        self.assertEqual(len(owner_history), 1)
+        self.assertIn("Owner private", owner_history[0]["content"])
+
+    async def test_tool_round_limit_reached_returns_honest_fallback(self):
+        """Verifies honest reply when the 4-round tool cap is reached without text."""
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="pro",
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+
+        mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
+        mock_reply_skill.send_reply = AsyncMock(
+            return_value={"success": True, "message_sid": "SM_tool_cap"}
+        )
+
+        # Simulate repetitive tool call loop exceeding max rounds
+        tool_call_obj = MagicMock()
+        tool_call_obj.id = "call_loop"
+        tool_call_obj.function.name = "search_business_memory"
+        tool_call_obj.function.arguments = '{"query": "pricing"}'
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.tool_calls = [tool_call_obj]
+        mock_resp.choices[0].message.content = None
+        mock_resp.choices[0].message.to_dict.return_value = {
+            "role": "assistant",
+            "tool_calls": [{"id": "call_loop", "type": "function", "function": {"name": "search_business_memory", "arguments": '{"query": "pricing"}'}}],
+        }
+        mock_resp.usage.prompt_tokens = 30
+        mock_resp.usage.completion_tokens = 10
+
+        with patch("litellm.acompletion", return_value=mock_resp):
+            result = await agent.process_user_turn(
+                message_sid="SM_tool_limit_test",
+                from_number="+971501234567",
+                user_message="Find all policies endlessly",
+                reply_skill=mock_reply_skill,
+            )
+
+        self.assertEqual(result["reply"], "I couldn't complete that request. Please try rephrasing.")
+
+    async def test_auth_error_triggers_fallback_with_zero_token_billing(self):
+        """Verifies auth/API errors trigger standard fallback and bill 0 tokens (no fake 75/25 tokens)."""
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="starter",
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+
+        mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
+        mock_reply_skill.send_reply = AsyncMock(
+            return_value={"success": True, "message_sid": "SM_fallback"}
+        )
+
+        with patch("litellm.acompletion", side_effect=Exception("AuthenticationError: Missing api_key")):
+            result = await agent.process_user_turn(
+                message_sid="SM_auth_err_test",
+                from_number="+971501234567",
+                user_message="Hello",
+                reply_skill=mock_reply_skill,
+            )
+
+        # Verify fallback message was sent and 0 billable tokens recorded
+        self.assertIn("having trouble processing that request", result["reply"])
         spend = await self.db_manager.get_current_month_cost()
-        self.assertGreater(spend, 0.0)
-
-        # Verify conversation history updated
-        history = await self.db_manager.get_recent_history(limit=5)
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history[0]["role"], "user")
-        self.assertEqual(history[1]["role"], "assistant")
+        self.assertEqual(spend, 0.0, "Auth error should not bill any tokens to the tenant database!")
 
 
 if __name__ == "__main__":

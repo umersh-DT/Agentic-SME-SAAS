@@ -70,15 +70,21 @@ class LiteLLMAgent:
     async def _alert_platform_owner_if_configured(
         self, reply_client: WhatsAppReplySkill, alert_text: str
     ) -> None:
-        """Sends an urgent platform notification if an alert destination is configured."""
+        """Sends platform notification once per tenant per month if configured."""
         platform_phone = os.getenv("PLATFORM_ALERT_WHATSAPP") or self.settings.get("platform", {}).get(
             "alert_whatsapp"
         )
-        if platform_phone:
-            try:
+        if not platform_phone:
+            return
+
+        try:
+            already_alerted = await self.db_manager.has_alerted_this_month("quota")
+            if not already_alerted:
                 await reply_client.send_reply(to_number=platform_phone, message=alert_text)
-            except Exception as e:
-                logger.error(f"[PLATFORM ALERT FAILED] Could not notify {platform_phone}: {e}")
+                await self.db_manager.record_monthly_alert("quota")
+                logger.info(f"[PLATFORM ALERT DISPATCHED] Notified {platform_phone} for tenant {self.tenant_id}")
+        except Exception as e:
+            logger.error(f"[PLATFORM ALERT FAILED] Could not notify {platform_phone}: {e}")
 
     async def process_user_turn(
         self,
@@ -110,7 +116,6 @@ class LiteLLMAgent:
                 await reply_client.send_reply(to_number=from_number, message=cap_reply)
                 await self.db_manager.update_message_status(message_sid, "quota_exceeded")
 
-                # Send platform alert
                 alert_text = (
                     f"⚠️ [QUOTA ALERT] Tenant '{self.tenant_id}' ({self.business_name}) has reached "
                     f"its monthly quota: ${current_spend:.2f} / ${max_quota:.2f}."
@@ -119,7 +124,15 @@ class LiteLLMAgent:
 
                 return {"status": "quota_exceeded", "spend": current_spend, "quota": max_quota}
 
-            # 2. Append User Message to Isolated Rolling History & Update Status
+            # 2. Persist message durability row (no-op if already saved by webhook)
+            await self.db_manager.persist_inbound_message(
+                message_sid=message_sid,
+                from_number=from_number,
+                body=user_message,
+                num_media=0,
+            )
+
+            # Append User Message to Isolated Rolling History & Update Status
             await self.db_manager.append_history(
                 message_sid=message_sid, role="user", content=user_message, from_number=from_number
             )
@@ -253,16 +266,18 @@ class LiteLLMAgent:
 
             # 8. Transmit Outbound Reply via WhatsApp
             send_result = await reply_client.send_reply(to_number=from_number, message=final_reply_text)
-            send_status = send_result.get("status") if isinstance(send_result, dict) else "sent"
+            
+            # Real return shape check: {"success": True, "message_sid": ...}
+            is_success = bool(isinstance(send_result, dict) and send_result.get("success") is True)
 
             # 9. Mark Status: completed only if send succeeded, otherwise failed
-            if send_status in ("sent", "delivered", "queued"):
+            if is_success:
                 await self.db_manager.update_message_status(message_sid, "completed")
             else:
                 await self.db_manager.update_message_status(message_sid, "failed")
 
             return {
-                "status": "completed" if send_status in ("sent", "delivered", "queued") else "failed",
+                "status": "completed" if is_success else "failed",
                 "reply": final_reply_text,
                 "send_result": send_result,
                 "prompt_tokens": accumulated_prompt_tokens,
@@ -271,7 +286,6 @@ class LiteLLMAgent:
 
         except Exception as e:
             logger.exception(f"[AGENT FATAL TURN ERROR] Tenant={self.tenant_id} turn crashed: {e}")
-            # Ensure sender always receives a fallback reply on failure
             try:
                 await reply_client.send_reply(to_number=from_number, message=fallback_msg)
             except Exception as send_err:

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -47,7 +48,7 @@ def split_message_text(text: str, max_chars: int = 1550) -> List[str]:
 
 
 class WhatsAppReplySkill:
-    """Dispatches outbound WhatsApp messages via Twilio REST API using httpx with automatic chunking."""
+    """Dispatches outbound WhatsApp messages via Twilio REST API with retries, pacing, and chunking."""
 
     def __init__(
         self,
@@ -68,11 +69,17 @@ class WhatsAppReplySkill:
         return cleaned if cleaned.startswith("whatsapp:") else f"whatsapp:{cleaned}"
 
     async def send_reply(self, to_number: str, message: str) -> Dict[str, Any]:
-        """Alias for send_message matching Stage 3 dispatcher interface."""
+        """Alias for send_message matching dispatcher and agent loop interface."""
         return await self.send_message(to_number=to_number, body=message)
 
-    async def send_message(self, to_number: str, body: str) -> Dict[str, Any]:
-        """Dispatches outbound WhatsApp message chunks via Twilio REST API."""
+    async def send_message(
+        self,
+        to_number: str,
+        body: str,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Dispatches outbound WhatsApp message chunks with 429/5xx retry backoff and pacing."""
         if not self.account_sid or not self.auth_token:
             logger.warning("Twilio credentials missing: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not configured.")
             return {
@@ -92,28 +99,61 @@ class WhatsAppReplySkill:
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             for idx, chunk in enumerate(chunks):
+                # 300ms pacing delay between multi-part chunks
+                if idx > 0:
+                    await asyncio.sleep(0.3)
+
                 data = {
                     "To": target_to,
                     "From": target_from,
                     "Body": chunk,
                 }
-                try:
-                    resp = await client.post(url, data=data, auth=auth)
-                    if resp.status_code in (200, 201):
-                        resp_data = resp.json()
-                        sid = resp_data.get("sid", f"SM_mock_{idx}")
-                        last_sid = sid
-                        sent_sids.append(sid)
-                    else:
-                        logger.error(f"[TWILIO REST ERROR] Status {resp.status_code}: {resp.text}")
-                        return {
-                            "success": False,
-                            "error": f"Twilio API error {resp.status_code}",
-                            "details": resp.text,
-                        }
-                except Exception as e:
-                    logger.error(f"[TWILIO DISPATCH FAILED] {e}")
-                    return {"success": False, "error": str(e)}
+
+                chunk_delivered = False
+                attempt = 0
+                last_error_text = ""
+
+                while attempt < max_retries and not chunk_delivered:
+                    attempt += 1
+                    try:
+                        resp = await client.post(url, data=data, auth=auth)
+                        if resp.status_code in (200, 201):
+                            resp_data = resp.json()
+                            sid = resp_data.get("sid", f"SM_mock_{idx}")
+                            last_sid = sid
+                            sent_sids.append(sid)
+                            chunk_delivered = True
+                        elif resp.status_code in (429, 500, 502, 503, 504):
+                            last_error_text = f"HTTP {resp.status_code}: {resp.text}"
+                            logger.warning(
+                                f"[TWILIO RETRY] Transient error {resp.status_code} on attempt {attempt}/{max_retries}. Backing off."
+                            )
+                            if attempt < max_retries:
+                                await asyncio.sleep(backoff_factor * (2 ** (attempt - 1)))
+                        else:
+                            logger.error(f"[TWILIO REST ERROR] Fatal status {resp.status_code}: {resp.text}")
+                            return {
+                                "success": False,
+                                "error": f"Twilio API fatal error {resp.status_code}",
+                                "details": resp.text,
+                            }
+                    except httpx.RequestError as e:
+                        last_error_text = str(e)
+                        logger.warning(
+                            f"[TWILIO NETWORK RETRY] Network error {e} on attempt {attempt}/{max_retries}."
+                        )
+                        if attempt < max_retries:
+                            await asyncio.sleep(backoff_factor * (2 ** (attempt - 1)))
+                    except Exception as e:
+                        logger.error(f"[TWILIO DISPATCH FAILED] Unexpected error: {e}")
+                        return {"success": False, "error": str(e)}
+
+                if not chunk_delivered:
+                    return {
+                        "success": False,
+                        "error": f"Failed after {max_retries} attempts: {last_error_text}",
+                        "sent_sids": sent_sids,
+                    }
 
         return {
             "success": True,

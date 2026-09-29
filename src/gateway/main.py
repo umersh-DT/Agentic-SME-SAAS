@@ -1,11 +1,37 @@
+import asyncio
+from contextlib import asynccontextmanager
+import logging
 import time
 from fastapi import FastAPI, Request, Response
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-from src.gateway.twilio_webhook import router as twilio_router
+from src.gateway.twilio_webhook import (
+    router as twilio_router,
+    replay_all_pending_messages,
+)
 from src.gateway.stripe_billing import router as stripe_router
 
-app = FastAPI(title="Agentic SaaS Ingress Gateway", version="1.0.0")
+logger = logging.getLogger("gateway_main")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles startup recovery tasks and graceful teardown."""
+    logger.info("[STARTUP] Initializing Agentic SaaS Gateway lifespan...")
+    try:
+        # Replay any pending messages left unfinished across tenants after a restart
+        await replay_all_pending_messages()
+    except Exception as e:
+        logger.error(f"[STARTUP ERROR] Error replaying pending messages during boot: {e}", exc_info=True)
+    yield
+    logger.info("[SHUTDOWN] Terminating Agentic SaaS Gateway lifespan...")
+
+
+app = FastAPI(
+    title="Agentic SaaS Ingress Gateway",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 # --- Prometheus Metrics Definitions ---
 HTTP_REQUESTS_TOTAL = Counter(
@@ -19,6 +45,7 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
     ["endpoint"],
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 )
+
 
 @app.middleware("http")
 async def prometheus_metrics_middleware(request: Request, call_next):
@@ -42,9 +69,11 @@ async def prometheus_metrics_middleware(request: Request, call_next):
             HTTP_REQUEST_DURATION_SECONDS.labels(endpoint=endpoint).observe(duration)
     return response
 
+
 # Include Ingress Routers
 app.include_router(twilio_router)
 app.include_router(stripe_router)
+
 
 @app.get("/health")
 async def health_check():
@@ -53,6 +82,7 @@ async def health_check():
         "service": "agentic-gateway",
         "phase": 4,
     }
+
 
 @app.get("/metrics")
 async def metrics():

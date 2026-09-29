@@ -202,7 +202,6 @@ class TenantDatabaseManager:
                     (limit,),
                 )
             rows = cursor.fetchall()
-            # Reverse to maintain chronological order [oldest ... newest]
             return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
     async def get_recent_history(
@@ -238,11 +237,45 @@ class TenantDatabaseManager:
 
     # --- Invoice Storage Operations ---
 
+    def _sync_get_next_invoice_number(self) -> str:
+        """Calculates next sequential invoice number per tenant per year using database records."""
+        prefix = self.tenant_id.replace("tenant_", "")[:4].upper()
+        year = datetime.now(timezone.utc).year
+        pattern = f"INV-{prefix}-{year}-%"
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT invoice_number FROM invoices 
+                WHERE tenant_id = ? AND invoice_number LIKE ?;
+                """,
+                (self.tenant_id, pattern),
+            )
+            rows = cursor.fetchall()
+            max_counter = 1000
+            for row in rows:
+                inv_num = str(row["invoice_number"])
+                parts = inv_num.rsplit("-", 1)
+                if len(parts) == 2:
+                    try:
+                        seq = int(parts[1])
+                        if seq > max_counter:
+                            max_counter = seq
+                    except ValueError:
+                        pass
+            return f"INV-{prefix}-{year}-{max_counter + 1}"
+
+    async def get_next_invoice_number(self) -> str:
+        """Async accessor for calculating next invoice sequence number."""
+        return await asyncio.to_thread(self._sync_get_next_invoice_number)
+
     def _sync_save_invoice_draft(self, draft: Dict[str, Any]) -> None:
+        """Inserts invoice draft using standard INSERT. Duplicate keys fail loudly."""
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO invoices (
+                INSERT INTO invoices (
                     invoice_number, tenant_id, client_name, client_contact,
                     currency, subtotal, tax_amount, grand_total,
                     deposit_percentage, required_deposit, balance_due,
@@ -350,11 +383,7 @@ class TenantDatabaseManager:
         )
 
     async def check_quota_exceeded(self, plan_tier: str, settings: Dict[str, Any]) -> Tuple[bool, float, float]:
-        """Checks if tenant has exceeded monthly USD quota.
-        
-        Returns:
-            Tuple[bool, float, float]: (is_exceeded, current_spend, max_quota)
-        """
+        """Checks if tenant has exceeded monthly USD quota."""
         quotas = settings.get("quotas_usd_monthly", {"starter": 5.0, "pro": 20.0, "enterprise": 100.0})
         max_quota = float(quotas.get(plan_tier, quotas.get("starter", 5.0)))
         current_spend = await self.get_current_month_cost()
