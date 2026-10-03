@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
 import logging
@@ -5,7 +6,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.core.storage_models import TenantDatabaseManager
 from src.skills.invoicing import InvoicingSkill, LineItem
+from src.skills.google_calendar import CalendarNotShared, GoogleCalendarBooking, SlotUnavailable, not_shared_message
 from src.skills.memory_tree import TenantMemoryTree
+from src.skills.website_seo import build_seo_report
 
 logger = logging.getLogger("tools_registry")
 
@@ -118,10 +121,173 @@ async def _execute_search_memory(
         return "Failed to search business memory records."
 
 
+def _parse_day(value: str) -> date:
+    return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+
+
+def _calendar(profile: Dict[str, Any]) -> GoogleCalendarBooking:
+    return GoogleCalendarBooking(
+        calendar_id=profile["google_calendar_id"],
+        timezone=profile.get("timezone") or "Asia/Dubai",
+        business_hours=profile.get("business_hours") or "09:00-18:00",
+        slot_minutes=int(profile.get("appointment_minutes") or 60),
+    )
+
+
+async def _execute_check_availability(profile: Dict[str, Any], date: str) -> str:
+    try:
+        day = _parse_day(date)
+        slots = await _calendar(profile).free_slots(day)
+    except ValueError:
+        return "Please give the date as YYYY-MM-DD."
+    except CalendarNotShared:
+        return not_shared_message()
+    except Exception as e:
+        logger.error(f"[TOOL CALENDAR] availability failed: {e}", exc_info=True)
+        return "I couldn't check the calendar right now."
+    label = day.strftime("%A %d %B %Y")
+    if not slots:
+        return f"No free slots on {label} within business hours."
+    times = ", ".join(start.strftime("%H:%M") for start, _ in slots)
+    return f"Free slots on {label}: {times}"
+
+
+async def _execute_book_appointment(
+    profile: Dict[str, Any],
+    customer_name: str,
+    date: str,
+    time: str,
+    service: str = "Appointment",
+    duration_minutes: Optional[int] = None,
+    customer_phone: str = "",
+) -> str:
+    calendar = None
+    try:
+        calendar = _calendar(profile)
+        start = datetime.strptime(f"{date.strip()} {time.strip()}", "%Y-%m-%d %H:%M")
+        booking = await calendar.book(
+            customer_name=customer_name,
+            start=start,
+            duration_minutes=int(duration_minutes or calendar.slot_minutes),
+            service=service or "Appointment",
+            customer_phone=customer_phone,
+            booked_by=profile.get("booked_by", ""),
+        )
+    except ValueError:
+        return "Please give the date as YYYY-MM-DD and the time as HH:MM (24-hour)."
+    except SlotUnavailable as e:
+        return f"Not booked: {e}"
+    except CalendarNotShared:
+        return not_shared_message()
+    except Exception as e:
+        logger.error(f"[TOOL CALENDAR] booking failed: {e}", exc_info=True)
+        return "I couldn't book that right now. Nothing was added to the calendar."
+    return (
+        f"Booked: {service or 'Appointment'} for {customer_name} on "
+        f"{booking['start'].strftime('%A %d %B %Y')}, {booking['start'].strftime('%H:%M')}-"
+        f"{booking['end'].strftime('%H:%M')}. It is now in the business Google Calendar."
+    )
+
+
+async def _execute_list_appointments(profile: Dict[str, Any], date: str) -> str:
+    try:
+        day = _parse_day(date)
+        events = await _calendar(profile).events_on(day)
+    except ValueError:
+        return "Please give the date as YYYY-MM-DD."
+    except CalendarNotShared:
+        return not_shared_message()
+    except Exception as e:
+        logger.error(f"[TOOL CALENDAR] listing failed: {e}", exc_info=True)
+        return "I couldn't read the calendar right now."
+    label = day.strftime("%A %d %B %Y")
+    if not events:
+        return f"Nothing booked on {label}."
+    lines = [
+        f"- {e['start'].strftime('%H:%M')}-{e['end'].strftime('%H:%M')} {e['summary']}" if e["start"]
+        else f"- All day: {e['summary']}"
+        for e in events
+    ]
+    return f"Appointments on {label}:\n" + "\n".join(lines)
+
+
+async def _execute_seo_report(profile: Dict[str, Any], focus: str = "") -> str:
+    return await build_seo_report(profile.get("website_url"), profile.get("search_console_property"))
+
+
+CALENDAR_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_availability",
+            "description": "List free appointment slots on a date in the business Google Calendar (within business hours).",
+            "parameters": {
+                "type": "object",
+                "properties": {"date": {"type": "string", "description": "Date as YYYY-MM-DD."}},
+                "required": ["date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_appointment",
+            "description": (
+                "Book an appointment in the business Google Calendar. Use only when the customer name, date and "
+                "time are clear; it refuses times that are taken, past, or outside business hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_name": {"type": "string", "description": "Customer's name."},
+                    "date": {"type": "string", "description": "Date as YYYY-MM-DD."},
+                    "time": {"type": "string", "description": "Start time as HH:MM, 24-hour, business local time."},
+                    "service": {"type": "string", "description": "What the appointment is for, e.g. Deep cleaning."},
+                    "duration_minutes": {"type": "integer", "description": "Optional length in minutes."},
+                    "customer_phone": {"type": "string", "description": "Optional customer phone number."},
+                },
+                "required": ["customer_name", "date", "time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_appointments",
+            "description": "List what is booked on a date in the business Google Calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {"date": {"type": "string", "description": "Date as YYYY-MM-DD."}},
+                "required": ["date"],
+            },
+        },
+    },
+]
+
+SEO_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "website_seo_report",
+        "description": (
+            "Run Google's website check (speed, SEO basics) on the business website and, if connected, "
+            "real Google Search numbers. Use when asked how the website or SEO is doing."
+        ),
+        # Gemini rejects function schemas with no properties, so this tool takes an optional focus.
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {"type": "string", "description": "Optional: what the user wants to know, e.g. speed."},
+            },
+        },
+    },
+}
+
+
 def get_scoped_tools(
     tenant_id: str,
     base_data_dir: str = "/app/data/tenants",
     created_invoices: Optional[List[str]] = None,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Callable]]:
     """Returns OpenAI/LiteLLM tool definitions and executable callables with tenant_id bound.
 
@@ -191,5 +357,14 @@ def get_scoped_tools(
         ),
         "search_business_memory": partial(_execute_search_memory, tenant_id, base_data_dir),
     }
+
+    profile = profile or {}
+    if profile.get("google_calendar_id"):
+        tools_schema.extend(CALENDAR_TOOL_SCHEMAS)
+        callables_map["check_availability"] = partial(_execute_check_availability, profile)
+        callables_map["book_appointment"] = partial(_execute_book_appointment, profile)
+        callables_map["list_appointments"] = partial(_execute_list_appointments, profile)
+    tools_schema.append(SEO_TOOL_SCHEMA)
+    callables_map["website_seo_report"] = partial(_execute_seo_report, profile)
 
     return tools_schema, callables_map

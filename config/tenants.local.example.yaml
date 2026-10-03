@@ -13,6 +13,13 @@ tenants:
     staff_phones:
       - "+971500000002"                   # replace or remove
     enabled_skills: ["invoicing", "memory_tree"]
+    # Optional extras:
+    # website_url: "https://example.com"                    # for "seo report"
+    # search_console_property: "sc-domain:example.com"      # real Google Search numbers
+    # google_calendar_id: "owner@gmail.com"                 # calendar shared with the service account
+    # timezone: "Asia/Dubai"
+    # business_hours: "09:00-18:00"
+    # appointment_minutes: 60
 
   - tenant_id: "tenant_demo_002"
     business_name: "Demo Photography"

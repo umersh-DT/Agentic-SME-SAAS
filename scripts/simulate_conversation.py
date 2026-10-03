@@ -19,13 +19,15 @@ import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import patch
+from datetime import date, timedelta
+from unittest.mock import AsyncMock, patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 os.chdir(REPO_ROOT)
 
 WORK_DIR = tempfile.mkdtemp(prefix="wa_sim_")
+TOMORROW = (date.today() + timedelta(days=1)).isoformat()
 APP_SECRET = "simulated_meta_app_secret"
 VERIFY_TOKEN = "simulated_verify_token"
 PHONE_NUMBER_ID = "109876543210"
@@ -55,7 +57,8 @@ with open(os.environ["TENANTS_CONFIG_PATH"], encoding="utf-8") as f:
 with open(os.environ["TENANTS_CONFIG_PATH"], "w", encoding="utf-8") as f:
     f.write(cfg_text.replace(
         'owner_phone: "+971501234567"\n    staff_phones: []',
-        f'owner_phone: "+971501234567"\n    staff_phones: ["{STAFF}"]',
+        f'owner_phone: "+971501234567"\n    staff_phones: ["{STAFF}"]\n'
+        f'    google_calendar_id: "luxe.owner@gmail.com"\n    business_hours: "09:00-18:00"',
         1,
     ))
 
@@ -89,11 +92,20 @@ async def fake_ai(model, messages, **kwargs):
     usage = SimpleNamespace(prompt_tokens=420, completion_tokens=60)
     last = messages[-1]
     if last["role"] == "tool":
-        reply = _msg(content=f"Here is the draft:\n{last['content']}")
+        prefix = "Here is the draft:\n" if last["name"] == "create_invoice" else ""
+        reply = _msg(content=f"{prefix}{last['content']}")
     else:
         text = last["content"]
         amount = re.search(r"([\d,]+(?:\.\d+)?)\s*AED", text, re.IGNORECASE)
-        if text.lower().startswith("invoice") and amount:
+        booking = re.search(r"^book (\w+) for (.+) on (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2})", text, re.IGNORECASE)
+        if booking:
+            name, service, day, at = booking.groups()
+            call = SimpleNamespace(id="call_book", function=SimpleNamespace(
+                name="book_appointment",
+                arguments=json.dumps({"customer_name": name, "service": service, "date": day, "time": at}),
+            ))
+            reply = _msg(tool_calls=[call])
+        elif text.lower().startswith("invoice") and amount:
             name = text.split()[1]
             call = SimpleNamespace(
                 id="call_1",
@@ -134,8 +146,34 @@ async def fake_http_post(self, url, json=None, headers=None, files=None, **kwarg
     return httpx.Response(200, request=request, json={"messages": [{"id": f"wamid.out_{len(outbox)}"}]})
 
 
+GOOGLE_CALENDAR = {"busy": [], "events": []}
+
+
+async def fake_google_request(self, method, url, headers=None, json=None, params=None, **kwargs):
+    """Stand-in for the Google Calendar API (freeBusy + events insert)."""
+    request = httpx.Request(method, url)
+    if url.endswith("/freeBusy"):
+        cal_id = json["items"][0]["id"]
+        return httpx.Response(200, request=request, json={"calendars": {cal_id: {"busy": GOOGLE_CALENDAR["busy"]}}})
+    GOOGLE_CALENDAR["events"].append(json)
+    GOOGLE_CALENDAR["busy"].append({"start": json["start"]["dateTime"], "end": json["end"]["dateTime"]})
+    return httpx.Response(200, request=request, json={"id": f"evt_{len(GOOGLE_CALENDAR['events'])}", **json})
+
+
+PAGESPEED = {"lighthouseResult": {
+    "categories": {"performance": {"score": 0.58, "auditRefs": [{"id": "largest-contentful-paint", "weight": 25}]},
+                   "seo": {"score": 0.83, "auditRefs": [{"id": "meta-description", "weight": 1}]},
+                   "accessibility": {"score": 0.9, "auditRefs": []}, "best-practices": {"score": 0.96, "auditRefs": []}},
+    "audits": {"largest-contentful-paint": {"title": "Largest Contentful Paint", "score": 0.2,
+                                            "scoreDisplayMode": "numeric", "displayValue": "4.1 s"},
+               "meta-description": {"title": "Document does not have a meta description", "score": 0,
+                                    "scoreDisplayMode": "binary"}}}}
+
+
 async def fake_http_get(self, url, headers=None, **kwargs):
     request = httpx.Request("GET", url)
+    if "pagespeedonline" in url:
+        return httpx.Response(200, request=request, json=PAGESPEED)
     if url.endswith("/MEDIA_1"):
         return httpx.Response(200, request=request, json={"url": "https://lookaside.fbsbx.com/voice", "mime_type": "audio/ogg; codecs=opus"})
     return httpx.Response(200, request=request, content=b"OggS-simulated-voice-note")
@@ -175,6 +213,7 @@ def show(label, sender, shown_text, response):
 
 def main():
     tenant_directory.reload_tenants()
+    tenant_directory.tenants["tenant_curtains_001"].website_url = "https://luxecurtains.example.com"
     dispatcher.data_root = os.environ["TENANTS_DATA_DIR"]
     def text(body, msg_id):
         return {"id": msg_id, "type": "text", "text": {"body": body}}
@@ -193,11 +232,16 @@ def main():
         ("OWNER", OWNER, "forget rule 2", text("forget rule 2", "wamid.sim_12")),
         ("STAFF", STAFF, "list rules", text("list rules", "wamid.sim_13")),
         ("STAFF", STAFF, "help", text("help", "wamid.sim_14")),
+        ("STAFF", STAFF, f"Book Sara for Deep cleaning on {TOMORROW} at 15:00", text(f"Book Sara for Deep cleaning on {TOMORROW} at 15:00", "wamid.sim_15")),
+        ("OWNER", OWNER, f"Book Omar for Curtain fitting on {TOMORROW} at 15:30", text(f"Book Omar for Curtain fitting on {TOMORROW} at 15:30", "wamid.sim_16")),
+        ("OWNER", OWNER, "seo report", text("seo report", "wamid.sim_17")),
         ("UNKNOWN", STRANGER, "hi, is this the curtain shop?", text("hi, is this the curtain shop?", "wamid.sim_6")),
         ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders. (Meta re-delivers)", text("Remember: deposits are 50% upfront for all curtain orders.", "wamid.sim_1")),
     ]
     with patch("litellm.acompletion", fake_ai), patch.object(httpx.AsyncClient, "post", fake_http_post), \
-            patch.object(httpx.AsyncClient, "get", fake_http_get):
+            patch.object(httpx.AsyncClient, "get", fake_http_get), \
+            patch.object(httpx.AsyncClient, "request", fake_google_request), \
+            patch("src.skills.google_calendar.google_auth_headers", AsyncMock(return_value={"Authorization": "Bearer sim"})):
         client = TestClient(app)
         check = client.get("/webhook/whatsapp", params={
             "hub.mode": "subscribe", "hub.verify_token": VERIFY_TOKEN, "hub.challenge": "8675309"})
@@ -215,6 +259,7 @@ def main():
     print("messages:", [tuple(r) for r in statuses])
     print("invoice:", tuple(invoice))
     print(f"AI model: {os.environ['LLM_MODEL']}")
+    print("Google Calendar events created:", [e["summary"] + " @ " + e["start"]["dateTime"] for e in GOOGLE_CALENDAR["events"]])
     print(f"Voice note transcription cost recorded: ${voice_cost['cost_usd']:.6f}")
     print(f"AI usage recorded: {usage['n']} turns, {usage['t']} tokens, ${usage['c']:.6f}")
     shutil.rmtree(WORK_DIR)

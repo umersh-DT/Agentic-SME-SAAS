@@ -16,6 +16,7 @@ venv/
 
 # Real business list with real phone numbers (server only)
 config/tenants.local.yaml
+config/google-service-account.json
 
 # Tenant Data & SQLite DBs (Strict isolation)
 data/tenants/*.db

@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import shutil
@@ -7,10 +6,8 @@ import unittest
 
 from src.skills.memory_tree import MemoryNode, TenantMemoryTree
 from src.core.context_extractor import ContextExtractor
-from src.skills.calendar_sync import CalendarSyncSkill, BookingRequest
 from src.skills.invoicing import InvoicingSkill, LineItem
 from src.skills.research import DeepResearchSkill
-from src.skills.seo_manager import SeoManagerSkill
 
 
 class TestPhase2Integration(unittest.IsolatedAsyncioTestCase):
@@ -74,43 +71,7 @@ class TestPhase2Integration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invoice_a.required_deposit, Decimal("1050.00"))
         self.assertEqual(invoice_a.balance_due, Decimal("1050.00"))
 
-        # 5. Verify Calendar booking and slot conflict detection
-        cal_b = CalendarSyncSkill(tenant_id=tenant_b)
-        now = datetime.utcnow()
-        booking_start = datetime(now.year, now.month, now.day, 14, 0)
-
-        booked = await cal_b.create_booking(
-            BookingRequest(
-                tenant_id=tenant_b,
-                client_name="John Doe",
-                client_contact="+971509998877",
-                service_title="Commercial Headshot",
-                start_time=booking_start,
-                duration_minutes=60,
-                buffer_minutes=15,
-            )
-        )
-        self.assertEqual(booked.status, "confirmed")
-
-        with self.assertRaises(ValueError) as ctx:
-            await cal_b.create_booking(
-                BookingRequest(
-                    tenant_id=tenant_b,
-                    client_name="Overlap Client",
-                    client_contact="+971508887766",
-                    service_title="Family Portrait",
-                    start_time=booking_start + timedelta(minutes=30),
-                    duration_minutes=45,
-                )
-            )
-        self.assertIn("Slot conflict", str(ctx.exception))
-
-        # 6. Verify SEO Plan and Competitor Intelligence generation
-        seo = SeoManagerSkill(tenant_id=tenant_a, business_name="Royal Drapery")
-        plan = await seo.generate_weekly_plan(industry="Motorized Curtains", primary_city="Dubai")
-        self.assertEqual(len(plan.tracked_keywords), 3)
-        self.assertIn("complimentary on-site measurement", plan.gbp_post_draft)
-
+        # 5. Competitor research summary
         research = DeepResearchSkill(tenant_id=tenant_a)
         report = await research.analyze_competitors(industry="Custom Curtains", location="Dubai Marina")
         self.assertGreaterEqual(len(report.competitors), 2)

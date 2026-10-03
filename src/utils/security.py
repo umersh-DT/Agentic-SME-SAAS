@@ -54,6 +54,30 @@ class TenantConfig(BaseModel):
     )
     website_url: Optional[str] = None
     target_keywords: List[str] = Field(default_factory=list)
+    # Google Calendar to book into (usually the owner's Gmail address), shared with the service account
+    google_calendar_id: Optional[str] = None
+    timezone: str = "Asia/Dubai"
+    business_hours: str = "09:00-18:00"
+    appointment_minutes: int = Field(default=60, ge=5, le=480)
+    # Search Console property, e.g. "sc-domain:example.com" or "https://example.com/"
+    search_console_property: Optional[str] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ValueError(f"Unknown timezone '{v}' (use names like Asia/Dubai).") from e
+        return v
+
+    @field_validator("business_hours")
+    @classmethod
+    def validate_business_hours(cls, v: str) -> str:
+        if not re.match(r"^\s*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*$", v or ""):
+            raise ValueError(f"business_hours must look like 09:00-18:00, got '{v}'.")
+        return v.replace(" ", "")
 
     @field_validator("tenant_id")
     @classmethod

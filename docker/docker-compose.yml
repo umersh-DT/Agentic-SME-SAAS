@@ -40,6 +40,9 @@ services:
       # rejects every request while STRIPE_WEBHOOK_SECRET is empty (fail-closed).
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      # Optional: higher quota for Google's free website check (works without a key at low volume).
+      - PAGESPEED_API_KEY=${PAGESPEED_API_KEY:-}
+      # Google Calendar / Search Console use the service account key at config/google-service-account.json
       # Optional second alert channel (WhatsApp) in addition to email.
       - PLATFORM_ALERT_WHATSAPP=${PLATFORM_ALERT_WHATSAPP:-}
       # Business list file inside config/. Use tenants.local.yaml for real numbers (kept out of git).

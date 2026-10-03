@@ -152,6 +152,22 @@ spend passes the plan amount in `quotas_usd_monthly`. Set `enforce: true` and re
 * Owner only: `Remember: …` (teach a rule), `list rules`, `change rule 2: new text`, `forget rule 2`,
   `approve invoice 1001` (sends the final PDF without DRAFT). These commands do not use the AI.
 
+### Google Calendar bookings and SEO report (free Google services)
+One-time (operator):
+1. console.cloud.google.com → create a project → enable **Google Calendar API**, **Google Search Console API**
+   and **PageSpeed Insights API**.
+2. IAM & Admin → Service accounts → Create (no roles needed) → Keys → Add key → JSON.
+3. Copy the file to the server as `config/google-service-account.json` (git-ignored) and restart.
+   Its `client_email` (…@….iam.gserviceaccount.com) is the address owners share with.
+
+Per business (owner + operator):
+* **Calendar:** owner opens Google Calendar → Settings → their calendar → *Share with specific people* → adds the
+  service account email with **Make changes to events**. Operator sets `google_calendar_id` (usually the owner's
+  Gmail address), and optionally `timezone`, `business_hours`, `appointment_minutes` in `config/tenants.local.yaml`.
+* **SEO:** operator sets `website_url`. For real Google Search numbers the owner adds the service account email as
+  a user in Google Search Console, and the operator sets `search_console_property`
+  (e.g. `sc-domain:example.com`).
+
 ---
 
 ## 5. Backups

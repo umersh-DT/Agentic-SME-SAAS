@@ -130,6 +130,16 @@ class StrictTenantDirectory:
 tenant_directory = StrictTenantDirectory()
 
 
+PROFILE_FIELDS = (
+    "website_url", "search_console_property", "google_calendar_id", "timezone", "business_hours", "appointment_minutes",
+)
+
+
+def tenant_profile(config: TenantConfig) -> Dict[str, Any]:
+    """Per-business settings the assistant's tools need (calendar, timezone, website)."""
+    return {field: getattr(config, field) for field in PROFILE_FIELDS}
+
+
 NOT_REGISTERED_NOTICE = (
     "This phone number is not registered with an active business assistant. "
     "Please contact your business administrator."
@@ -182,6 +192,7 @@ async def replay_all_pending_messages(base_data_dir: Optional[str] = None) -> No
                 plan_tier=config.plan_tier,
                 business_name=config.business_name,
                 owner_phone=config.owner_phone,
+                profile=tenant_profile(config),
             )
             if replayed:
                 logger.info(f"[STARTUP REPLAY] Replayed {len(replayed)} messages for tenant={tenant_id}")
@@ -263,6 +274,7 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
             plan_tier=tenant_config.plan_tier,
             business_name=tenant_config.business_name,
             owner_phone=tenant_config.owner_phone,
+            profile=tenant_profile(tenant_config),
         )
         return "voice_dispatched"
 
@@ -284,6 +296,7 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
         plan_tier=tenant_config.plan_tier,
         business_name=tenant_config.business_name,
         owner_phone=tenant_config.owner_phone,
+        profile=tenant_profile(tenant_config),
         from_number=from_number,
         body=body_text,
         message_sid=message_id,

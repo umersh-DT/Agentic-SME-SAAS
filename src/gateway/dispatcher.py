@@ -10,6 +10,7 @@ from src.core.storage_models import TenantDatabaseManager, load_default_settings
 from src.skills.invoice_pdf import render_invoice_pdf
 from src.skills.memory_tree import TenantMemoryTree
 from src.skills.voice import transcribe_audio
+from src.skills.website_seo import build_seo_report
 from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.security import mask_phone_number, normalize_phone_number
 
@@ -27,7 +28,10 @@ HELP_TEXT = (
     "Here's what I can do:\n"
     "• Answer questions using your saved business rules\n"
     "• Draft invoices, e.g. \"Invoice Ali 500 AED for deep cleaning\" (the amount includes 5% VAT)\n"
-    "• Understand voice notes — just speak your request\n\n"
+    "• Understand voice notes — just speak your request\n"
+    "• Appointments (if a Google Calendar is connected): \"Is Thursday afternoon free?\", "
+    "\"Book Sara for deep cleaning tomorrow at 3pm\", \"What's on tomorrow?\"\n"
+    "• \"seo report\" — Google's check of the business website\n\n"
     "Owner only:\n"
     "• Teach a rule: \"Remember: we charge 150 AED per visit\"\n"
     "• \"list rules\" · \"change rule 2: new text\" · \"forget rule 2\"\n"
@@ -44,6 +48,9 @@ LIST_RULES_RE = re.compile(
 FORGET_RULE_RE = re.compile(r"^\s*(?:forget|delete|remove)\s+rule\s*#?\s*(\d+)\s*[.!]*\s*$", re.IGNORECASE)
 CHANGE_RULE_RE = re.compile(
     r"^\s*(?:change|update|edit)\s+rule\s*#?\s*(\d+)\s*(?:to\b|:|-|=)?\s*(.+?)\s*$", re.IGNORECASE | re.DOTALL
+)
+SEO_REPORT_RE = re.compile(
+    r"^\s*(?:seo|website)(?:\s+(?:report|check|status))?\s*[?.!]*\s*$", re.IGNORECASE
 )
 APPROVE_INVOICE_RE = re.compile(r"^\s*approve\s+invoice\s*#?\s*([A-Za-z0-9-]+)\s*[.!]*\s*$", re.IGNORECASE)
 
@@ -97,11 +104,22 @@ class TenantWorkerDispatcher:
     # --------------------------------------------------------------- commands
 
     async def _handle_command(
-        self, tenant_id: str, business_name: str, body: str, is_owner: bool, owner_phone: Optional[str]
+        self,
+        tenant_id: str,
+        business_name: str,
+        body: str,
+        is_owner: bool,
+        owner_phone: Optional[str],
+        profile: Optional[Dict[str, Any]] = None,
     ) -> Optional[Tuple[str, str]]:
-        """Handles help / rule management / invoice approval. Returns (command name, reply) or None."""
+        """Handles help / SEO report / rule management / invoice approval. Returns (command, reply) or None."""
         if HELP_RE.match(body):
             return "help", HELP_TEXT
+        if SEO_REPORT_RE.match(body):
+            profile = profile or {}
+            return "seo_report", await build_seo_report(
+                profile.get("website_url"), profile.get("search_console_property")
+            )
 
         list_match = LIST_RULES_RE.match(body)
         forget_match = FORGET_RULE_RE.match(body)
@@ -242,6 +260,7 @@ class TenantWorkerDispatcher:
         business_name: str = "Business Assistant",
         owner_phone: Optional[str] = None,
         heard_prefix: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Processes an incoming WhatsApp message with crash durability checks.
 
@@ -270,7 +289,7 @@ class TenantWorkerDispatcher:
             )
 
             # 1. Commands (help, rules, approvals) are answered directly without the AI
-            command = await self._handle_command(tenant_id, business_name, body, is_owner, owner_phone)
+            command = await self._handle_command(tenant_id, business_name, body, is_owner, owner_phone, profile)
             if command:
                 name, reply = command
                 reply = _join(heard_prefix, reply)
@@ -313,6 +332,7 @@ class TenantWorkerDispatcher:
                 plan_tier=plan_tier,
                 business_name=business_name,
                 base_data_dir=self.data_root,
+                profile=profile,
             )
             result = await agent.process_user_turn(
                 message_sid=message_sid,
@@ -372,6 +392,7 @@ class TenantWorkerDispatcher:
         plan_tier: str = "starter",
         business_name: str = "Business Assistant",
         owner_phone: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Downloads and transcribes a voice note, records its cost, then handles it like a typed message."""
         db_mgr = TenantDatabaseManager(tenant_id=tenant_id, base_dir=self.data_root)
@@ -421,6 +442,7 @@ class TenantWorkerDispatcher:
             business_name=business_name,
             owner_phone=owner_phone,
             heard_prefix=f"You said: \"{text}\"",
+            profile=profile,
         )
 
     async def replay_pending_messages(
@@ -429,6 +451,7 @@ class TenantWorkerDispatcher:
         plan_tier: str = "starter",
         business_name: str = "Business Assistant",
         owner_phone: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Recovers unfinished messages after a restart. Resets crashed 'processing' rows to 'pending'."""
         db_mgr = TenantDatabaseManager(tenant_id=tenant_id, base_dir=self.data_root)
@@ -472,6 +495,7 @@ class TenantWorkerDispatcher:
                     plan_tier=plan_tier,
                     business_name=business_name,
                     owner_phone=owner_phone,
+                    profile=profile,
                 )
             else:
                 res = await self.process_incoming_message(
@@ -479,6 +503,7 @@ class TenantWorkerDispatcher:
                     plan_tier=plan_tier,
                     business_name=business_name,
                     owner_phone=owner_phone,
+                    profile=profile,
                     from_number=msg["from_number"],
                     body=msg["body"] or "",
                     message_sid=msg["message_sid"],
