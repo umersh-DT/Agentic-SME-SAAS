@@ -8,23 +8,42 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("invoicing")
 
 
+CENT = Decimal("0.01")
+
+
+def split_tax_inclusive_total(gross: Decimal, tax_rate: Decimal) -> "tuple[Decimal, Decimal]":
+    """Splits a VAT-inclusive total into (net, tax) so that net + tax == gross exactly.
+
+    e.g. 2500.00 at 5% -> net 2380.95, tax 119.05.
+    """
+    gross = Decimal(gross).quantize(CENT, rounding=ROUND_HALF_UP)
+    net = (gross / (Decimal("1") + tax_rate)).quantize(CENT, rounding=ROUND_HALF_UP)
+    return net, gross - net
+
+
 class LineItem(BaseModel):
     description: str
     quantity: Decimal = Field(default=Decimal("1.0"), ge=0.01)
     unit_price: Decimal = Field(ge=0.0)
     tax_rate: Decimal = Field(default=Decimal("0.05"), ge=0.0)  # Default 5% VAT
+    # When True, unit_price already includes tax (the customer pays exactly quantity * unit_price).
+    price_includes_tax: bool = False
+
+    @property
+    def _line_amount(self) -> Decimal:
+        return (self.quantity * self.unit_price).quantize(CENT, rounding=ROUND_HALF_UP)
 
     @property
     def subtotal(self) -> Decimal:
-        return (self.quantity * self.unit_price).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+        if self.price_includes_tax:
+            return split_tax_inclusive_total(self._line_amount, self.tax_rate)[0]
+        return self._line_amount
 
     @property
     def tax_amount(self) -> Decimal:
-        return (self.subtotal * self.tax_rate).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+        if self.price_includes_tax:
+            return split_tax_inclusive_total(self._line_amount, self.tax_rate)[1]
+        return (self.subtotal * self.tax_rate).quantize(CENT, rounding=ROUND_HALF_UP)
 
     @property
     def total(self) -> Decimal:

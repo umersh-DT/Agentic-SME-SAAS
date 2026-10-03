@@ -19,6 +19,7 @@ def load_default_settings(config_path: str = "config/default_settings.yaml") -> 
             return yaml.safe_load(f) or {}
     return {
         "llm": {"model": "openai/gpt-4o-mini", "timeout_seconds": 25, "max_tokens": 800, "max_tool_rounds": 4},
+        "quotas": {"enforce": False},
         "quotas_usd_monthly": {"starter": 5.00, "pro": 20.00, "enterprise": 100.00},
         "pricing_per_1m_tokens": {"prompt_usd": 0.150, "completion_usd": 0.600},
         "whatsapp": {"max_message_chars": 1550, "history_limit": 10},

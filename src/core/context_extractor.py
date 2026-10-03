@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 import uuid
@@ -8,6 +7,55 @@ from pydantic import BaseModel, Field
 from src.skills.memory_tree import MemoryNode, TenantMemoryTree
 
 logger = logging.getLogger("context_extractor")
+
+
+# Phrases that signal the owner is teaching the assistant a business rule.
+# Matched on word boundaries against the lower-cased message.
+TEACHING_CUES = [
+    r"remember",
+    r"from now on",
+    r"going forward",
+    r"note that",
+    r"policy",
+    r"new rule",
+    r"rule is",
+    r"we always",
+    r"we never",
+    r"we don'?t",
+    r"we do not",
+    r"we require",
+    r"we charge",
+    r"we only",
+    r"our (?:price|prices|rate|rates|hours|deposit|fee|fees|terms)",
+    r"requires?",
+    r"required",
+    r"must",
+    r"mandatory",
+    r"non-refundable",
+    r"no refunds?",
+    r"^always",
+    r"^never",
+]
+_TEACHING_RE = re.compile(r"\b(?:" + "|".join(TEACHING_CUES) + r")\b")
+
+# Messages starting with these words are questions or commands, not rules.
+NON_RULE_FIRST_WORDS = {
+    "what", "when", "where", "who", "whom", "why", "how", "which",
+    "can", "could", "do", "does", "did", "is", "are", "was", "should", "would", "will",
+    "invoice", "create", "make", "draft", "approve", "send", "generate", "bill",
+    "remind", "tell", "show", "list", "find", "search", "check", "give", "explain",
+}
+
+# Leading filler removed before storing the rule text.
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:please\s+)?(?:(?:remember|note)\b(?:\s+that)?\s*[:,\-]?\s*)?", re.IGNORECASE
+)
+
+_STOPWORDS = {
+    "that", "this", "with", "from", "have", "will", "your", "their", "they", "them", "were",
+    "been", "into", "only", "also", "than", "then", "when", "what", "remember", "please", "always",
+    "never", "dont", "does", "should", "must", "every", "there", "these", "those", "about",
+}
 
 
 class ExtractedMemoryUpdate(BaseModel):
@@ -32,48 +80,54 @@ class ExtractedMemoryUpdate(BaseModel):
         default_factory=list,
         description="Key search terms or entities for FTS and concept linking.",
     )
-    supersedes_query: Optional[str] = Field(
-        default=None,
-        description="Search query to locate any previous conflicting rule this replaces.",
-    )
 
 
 class ContextExtractor:
-    """Extracts operational policies and business constraints from conversation streams
+    """Recognises business rules the owner teaches over WhatsApp and stores them in the tenant's memory tree.
 
-    and updates the tenant's memory tree.
+    Detection is deterministic (keyword cues), so it costs nothing and behaves predictably:
+    questions and invoice/commands are never stored as rules.
     """
 
     def __init__(self, memory_tree: TenantMemoryTree, llm_client: Optional[object] = None):
         self.memory_tree = memory_tree
         self.llm_client = llm_client
 
-    def _heuristic_fallback_parse(self, text: str) -> ExtractedMemoryUpdate:
-        """Deterministic rule parser for local testing without active external LLM credentials."""
-        lower = text.lower()
-        pricing_triggers = ["deposit", "price", "charge", "cost", "quote", "rate", "$", "usd", "aed", "eur"]
-        policy_triggers = ["always", "never", "must", "from now on", "policy", "require", "we don't", "we do"]
+    @staticmethod
+    def looks_like_rule(text: str) -> bool:
+        """True if the message reads as the sender teaching a business rule."""
+        lower = (text or "").strip().lower()
+        if not lower or lower.endswith("?"):
+            return False
+        lower = re.sub(r"^please\s+", "", lower)
+        first_word = re.split(r"[^a-z']+", lower, maxsplit=1)[0]
+        if first_word in NON_RULE_FIRST_WORDS:
+            return False
+        return bool(_TEACHING_RE.search(lower))
 
-        is_pricing = any(word in lower for word in pricing_triggers)
-        is_policy = any(phrase in lower for phrase in policy_triggers)
+    def parse(self, text: str) -> ExtractedMemoryUpdate:
+        """Turns a teaching message into a normalized memory update."""
+        if not self.looks_like_rule(text):
+            return ExtractedMemoryUpdate(is_rule_or_preference=False)
 
-        if is_pricing or is_policy:
-            category = "pricing" if is_pricing else "operations"
-            node_type = "pricing" if is_pricing else "policy"
-            words = [re.sub(r"[^\w]", "", w) for w in lower.split() if len(w) > 3]
-            concepts = list(set(words))[:5]
-            
-            return ExtractedMemoryUpdate(
-                is_rule_or_preference=True,
-                title=f"Update: {text[:30].strip()}...",
-                node_type=node_type,
-                category=category,
-                content=text.strip(),
-                concepts=concepts,
-                supersedes_query=" ".join(concepts[:2]) if concepts else None
-            )
+        content = _LEADING_FILLER_RE.sub("", text.strip(), count=1).strip() or text.strip()
+        content = content[0].upper() + content[1:]
 
-        return ExtractedMemoryUpdate(is_rule_or_preference=False)
+        lower = content.lower()
+        pricing_words = ["deposit", "price", "charge", "cost", "quote", "rate", "fee", "aed", "usd", "$", "%"]
+        is_pricing = any(word in lower for word in pricing_words)
+
+        words = [re.sub(r"[^\w]", "", w) for w in lower.split()]
+        concepts = list(dict.fromkeys(w for w in words if len(w) > 3 and w not in _STOPWORDS))[:8]
+
+        return ExtractedMemoryUpdate(
+            is_rule_or_preference=True,
+            title=content if len(content) <= 60 else f"{content[:57].rstrip()}...",
+            node_type="pricing" if is_pricing else "policy",
+            category="pricing" if is_pricing else "operations",
+            content=content,
+            concepts=concepts,
+        )
 
     async def extract_and_store(
         self,
@@ -81,65 +135,39 @@ class ContextExtractor:
         source_message_id: Optional[str] = None,
         parent_id: Optional[str] = None,
     ) -> Optional[MemoryNode]:
-        """Parses message content, evaluates policy updates, and writes directly to the memory tree."""
-        # Use heuristic fallback if no active LLM client is configured
-        update: ExtractedMemoryUpdate = self._heuristic_fallback_parse(text)
-
+        """Stores the rule in the message, if any. Re-processing the same message returns the saved rule."""
+        update = self.parse(text)
         if not update.is_rule_or_preference or not update.content:
             return None
 
-        superseded_node_id = None
-        if update.supersedes_query:
-            prior_nodes = await self.memory_tree.search_memory(update.supersedes_query, limit=1)
-            if prior_nodes:
-                superseded_node_id = prior_nodes[0]["id"]
+        if source_message_id:
+            existing = await self.memory_tree.get_node_by_source_message(source_message_id)
+            if existing:
+                logger.info(f"[CONTEXT EXTRACTOR] Rule for message {source_message_id} already saved; skipping.")
+                return MemoryNode(
+                    id=existing["id"],
+                    parent_id=existing["parent_id"],
+                    node_type=existing["node_type"],
+                    title=existing["title"],
+                    content=existing["content"],
+                    category=existing["category"],
+                    strength=existing["strength"],
+                    supersedes=existing["supersedes"],
+                    source_message_id=existing["source_message_id"],
+                    created_at=existing["created_at"],
+                )
 
-        node_id = f"node_{uuid.uuid4().hex[:12]}"
         node = MemoryNode(
-            id=node_id,
+            id=f"node_{uuid.uuid4().hex[:12]}",
             parent_id=parent_id,
             node_type=update.node_type or "policy",
             title=update.title or "Business Policy",
             content=update.content,
             category=update.category or "operations",
             strength=1.0,
-            supersedes=superseded_node_id,
+            supersedes=None,
             source_message_id=source_message_id,
         )
 
         await self.memory_tree.add_node(node, concepts=update.concepts)
         return node
-
-
-if __name__ == "__main__":
-    import asyncio
-    import shutil
-    from pathlib import Path
-
-    async def _test():
-        test_dir = Path("/tmp/test_extractor")
-        tree = TenantMemoryTree(tenant_id="tenant_photographer_001", base_data_dir=str(test_dir))
-        await tree.initialize()
-
-        extractor = ContextExtractor(memory_tree=tree)
-
-        # Message 1: Conversational noise (should be ignored)
-        node_1 = await extractor.extract_and_store("Hey, are you able to reply to messages today?")
-        print(f"Noise message extracted node: {node_1}")
-
-        # Message 2: Explicit policy rule (should be extracted and stored)
-        msg_rule = "From now on, we require a 25% non-refundable booking fee for weekend portrait sessions."
-        node_2 = await extractor.extract_and_store(msg_rule, source_message_id="msg_wa_1002")
-        print(f"[OK] Rule extracted successfully:")
-        print(f" - ID: {node_2.id}")
-        print(f" - Category: {node_2.category}")
-        print(f" - Content: {node_2.content}")
-
-        # Search the memory tree to verify full-text indexing
-        search_res = await tree.search_memory("portrait booking fee")
-        print(f"[OK] FTS Search verified: {len(search_res)} match found: {search_res[0]['title']}")
-
-        if test_dir.exists():
-            shutil.rmtree(test_dir)
-
-    asyncio.run(_test())

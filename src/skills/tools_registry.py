@@ -19,10 +19,8 @@ async def _execute_create_invoice(
     deposit_percentage: float = 0.0,
     client_contact: Optional[str] = None,
 ) -> str:
-    """Internal implementation for generating and saving customer invoice drafts with database sequence numbering."""
-    logger.info(
-        f"[TOOL INVOICE] Tenant={tenant_id} | Customer={customer_name} | Amount={amount} AED | Desc={description}"
-    )
+    """Generates and saves a draft invoice. `amount` is the TOTAL the customer pays, VAT included."""
+    logger.info(f"[TOOL INVOICE] Tenant={tenant_id} | Total={amount} AED (VAT inclusive)")
     try:
         db_mgr = TenantDatabaseManager(tenant_id=tenant_id, base_dir=base_data_dir)
         next_invoice_num = await db_mgr.get_next_invoice_number()
@@ -35,13 +33,14 @@ async def _execute_create_invoice(
         except (IndexError, ValueError):
             pass
 
-        # 2. Construct line item with 5% UAE VAT
+        # 2. Construct line item: the amount typed is the total, 5% UAE VAT is included in it
         items = [
             LineItem(
                 description=description,
                 quantity=Decimal("1.0"),
-                unit_price=Decimal(str(round(amount, 2))),
+                unit_price=Decimal(str(amount)),
                 tax_rate=Decimal("0.05"),
+                price_includes_tax=True,
             )
         ]
 
@@ -77,15 +76,15 @@ async def _execute_create_invoice(
         reply_lines = [
             f"Draft invoice generated: {draft.invoice_number}",
             f"Client: {draft.client_name}",
-            f"Subtotal: {draft.currency} {draft.subtotal:.2f}",
-            f"VAT (5%): {draft.currency} {draft.total_tax:.2f}",
-            f"Grand Total: {draft.currency} {draft.grand_total:.2f}",
+            f"Total (incl. 5% VAT): {draft.currency} {draft.grand_total:,.2f}",
+            f"Net amount: {draft.currency} {draft.subtotal:,.2f}",
+            f"VAT (5%): {draft.currency} {draft.total_tax:,.2f}",
         ]
         if draft.required_deposit > Decimal("0.00"):
             reply_lines.append(
-                f"Required Deposit ({draft.deposit_percentage:.0f}%): {draft.currency} {draft.required_deposit:.2f}"
+                f"Required Deposit ({draft.deposit_percentage:.0f}%): {draft.currency} {draft.required_deposit:,.2f}"
             )
-            reply_lines.append(f"Balance Due: {draft.currency} {draft.balance_due:.2f}")
+            reply_lines.append(f"Balance Due: {draft.currency} {draft.balance_due:,.2f}")
 
         reply_lines.append("Status: Draft invoice — not sent to client.")
         return "\n".join(reply_lines)
@@ -128,7 +127,11 @@ def get_scoped_tools(
             "type": "function",
             "function": {
                 "name": "create_invoice",
-                "description": "Create a draft invoice for services or products in AED. This saves a draft and does NOT send anything to the client.",
+                "description": (
+                    "Create a draft invoice in AED. The amount is the TOTAL the customer pays and already "
+                    "includes 5% VAT (e.g. 'Invoice Ali 2,500 AED' -> amount 2500). "
+                    "This saves a draft and does NOT send anything to the client."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -138,7 +141,7 @@ def get_scoped_tools(
                         },
                         "amount": {
                             "type": "number",
-                            "description": "Total monetary subtotal amount before tax in AED.",
+                            "description": "Total amount in AED INCLUDING 5% VAT, exactly as the user stated it. Do not add VAT on top.",
                         },
                         "description": {
                             "type": "string",

@@ -7,6 +7,12 @@ llm:
   timeout_seconds: 25
   max_tool_rounds: 4
 
+quotas:
+  # Free pilot: AI usage and cost are always recorded per business, but nobody is blocked.
+  # Set to true to block a business once it reaches its monthly amount below.
+  # Either way, the operator gets one alert email per business per month when it passes that amount.
+  enforce: false
+
 quotas_usd_monthly:
   starter: 5.00
   pro: 20.00

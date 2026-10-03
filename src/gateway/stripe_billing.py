@@ -13,7 +13,14 @@ import yaml
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
-from src.utils.security import TENANT_ID_REGEX, TenantConfig, get_safe_tenant_storage_path, normalize_phone_number
+from src.utils.security import (
+    TENANT_ID_REGEX,
+    TenantConfig,
+    describe_error_safely,
+    get_safe_tenant_storage_path,
+    mask_phone_number,
+    normalize_phone_number,
+)
 
 logger = logging.getLogger("gateway_stripe")
 
@@ -209,8 +216,9 @@ async def handle_stripe_webhook(
                 enabled_skills=["calendar_sync", "invoicing", "research", "memory_tree"],
             )
         except Exception as e:
-            logger.error(f"[STRIPE CUSTOMER DEFECT] Invalid tenant configuration for {tenant_id}: {e}.")
-            return Response(content=json.dumps({"status": "ignored_invalid_customer_data", "detail": str(e)}), media_type="application/json")
+            detail = describe_error_safely(e)
+            logger.error(f"[STRIPE CUSTOMER DEFECT] Invalid tenant configuration for {tenant_id}: {detail}.")
+            return Response(content=json.dumps({"status": "ignored_invalid_customer_data", "detail": detail}), media_type="application/json")
 
         from src.gateway.twilio_webhook import tenant_directory
 
@@ -221,7 +229,8 @@ async def handle_stripe_webhook(
             if norm_checkout_phone != existing_tenant.owner_phone and norm_checkout_phone != existing_tenant.whatsapp_number:
                 logger.critical(
                     f"[SECURITY ACCOUNT HIJACK] Checkout for existing {tenant_id} provided phone "
-                    f"'{norm_checkout_phone}', which does not match registered owner phone '{existing_tenant.owner_phone}'. "
+                    f"'{mask_phone_number(norm_checkout_phone)}', which does not match registered owner phone "
+                    f"'{mask_phone_number(existing_tenant.owner_phone)}'. "
                     f"Rejecting phone change to protect account routing."
                 )
                 return Response(
@@ -234,7 +243,7 @@ async def handle_stripe_webhook(
             existing_owner = tenant_directory.resolve_sender(norm_phone)
             if existing_owner and existing_owner != tenant_id:
                 logger.critical(
-                    f"[SECURITY HIJACK ATTEMPT] Phone {norm_phone} for new {tenant_id} is already "
+                    f"[SECURITY HIJACK ATTEMPT] Phone {mask_phone_number(norm_phone)} for new {tenant_id} is already "
                     f"registered to active tenant {existing_owner}. Aborting registration."
                 )
                 return Response(

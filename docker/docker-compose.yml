@@ -1,3 +1,7 @@
+# Start with (from the repository root):
+#   docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+# Every "${VAR:?...}" below is required: the stack refuses to start until it is set in .env.
+
 services:
   gateway:
     build:
@@ -6,23 +10,62 @@ services:
     image: docker-tenant_worker:latest
     container_name: agentic_sme_gateway
     restart: unless-stopped
-    command: uvicorn src.gateway.main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
+    # Single worker: dedup cache, rate limiter and tenant directory live in process memory.
+    # Proxy headers are trusted from any address because only Caddy can reach this port.
+    command: >
+      uvicorn src.gateway.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips=* --workers 1
+    # Reachable only from other containers (Caddy); never published on the host.
+    expose:
+      - "8000"
     environment:
       - PYTHONPATH=/app
-      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
-      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
-      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:-+14155238886}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
+      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:?set TWILIO_WHATSAPP_NUMBER in .env}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      - ALERT_EMAIL=${ALERT_EMAIL:?set ALERT_EMAIL in .env}
+      - SMTP_USER=${SMTP_USER:?set SMTP_USER in .env}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:?set SMTP_PASSWORD in .env}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - ALERT_FROM_EMAIL=${ALERT_FROM_EMAIL:-}
+      # Optional: billing is not used during the free pilot, and the Stripe webhook
+      # rejects every request while STRIPE_WEBHOOK_SECRET is empty (fail-closed).
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Optional second alert channel (WhatsApp) in addition to email.
       - PLATFORM_ALERT_WHATSAPP=${PLATFORM_ALERT_WHATSAPP:-}
       - TENANTS_CONFIG_PATH=/app/config/tenants.yaml
       - TENANTS_DATA_DIR=/app/data/tenants
     volumes:
-      - ..:/app
+      - ../config:/app/config
       - tenant_data:/app/data/tenants
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2
+    container_name: agentic_sme_caddy
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN in .env (e.g. assistant.example.com)}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
 
 volumes:
   tenant_data:
+  caddy_data:
+  caddy_config:

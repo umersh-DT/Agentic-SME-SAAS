@@ -187,6 +187,17 @@ class TenantMemoryTree:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def get_node_by_source_message(self, source_message_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the node saved from a given inbound message, if any (makes re-processing idempotent)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM memory_nodes WHERE source_message_id = ? ORDER BY created_at ASC LIMIT 1",
+                (source_message_id,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def get_children(self, parent_id: str) -> List[Dict[str, Any]]:
         """Returns all child nodes under a given category or parent node."""
         async with aiosqlite.connect(self.db_path) as db:

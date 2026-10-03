@@ -13,19 +13,11 @@ import yaml
 from src.core.storage_models import TenantDatabaseManager, load_default_settings
 from src.gateway.dispatcher import TenantWorkerDispatcher
 from src.skills.whatsapp_reply import WhatsAppReplySkill
-from src.utils.security import TenantConfig, normalize_phone_number
+from src.utils.security import TenantConfig, describe_error_safely, mask_phone_number, normalize_phone_number
 
 logger = logging.getLogger("gateway_twilio")
 
 router = APIRouter(prefix="/webhook", tags=["Twilio Ingress"])
-
-
-def mask_phone_number(phone: str) -> str:
-    """Masks phone number for privacy-compliant logging (e.g. +97150***67)."""
-    cleaned = phone.strip()
-    if len(cleaned) >= 8:
-        return f"{cleaned[:5]}***{cleaned[-2:]}"
-    return "***"
 
 
 class DeduplicationCache:
@@ -107,8 +99,9 @@ class StrictTenantDirectory:
             try:
                 config = TenantConfig(**item)
             except Exception as e:
-                logger.critical(f"[STARTUP FATAL] Invalid tenant schema in {effective_path}: {e}")
-                raise ValueError(f"Startup failed: invalid tenant configuration: {e}") from e
+                detail = describe_error_safely(e)
+                logger.critical(f"[STARTUP FATAL] Invalid tenant schema in {effective_path}: {detail}")
+                raise ValueError(f"Startup failed: invalid tenant configuration: {detail}") from None
 
             self.tenants[config.tenant_id] = config
 
@@ -158,6 +151,7 @@ async def replay_all_pending_messages(base_data_dir: Optional[str] = None) -> No
                 tenant_id=tenant_id,
                 plan_tier=config.plan_tier,
                 business_name=config.business_name,
+                owner_phone=config.owner_phone,
             )
             if replayed:
                 logger.info(f"[STARTUP REPLAY] Replayed {len(replayed)} messages for tenant={tenant_id}")
@@ -244,6 +238,7 @@ async def handle_whatsapp_webhook(
         tenant_id=tenant_id,
         plan_tier=tenant_config.plan_tier,
         business_name=tenant_config.business_name,
+        owner_phone=tenant_config.owner_phone,
         from_number=from_number,
         body=body_text,
         message_sid=message_sid,
