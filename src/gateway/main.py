@@ -1,13 +1,22 @@
 import asyncio
 from contextlib import asynccontextmanager
 import logging
+import os
 import time
 from fastapi import FastAPI, Request, Response
+
+# Show the app's own INFO lines (startup summary, routing, rules) in `docker compose logs`.
+# Must run before the webhook module is imported, because it loads the business list on import.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from src.gateway.whatsapp_webhook import (
     router as whatsapp_router,
     replay_all_pending_messages,
+    tenant_directory,
 )
 from src.gateway.stripe_billing import router as stripe_router
 from src.core.agent_loop import missing_model_api_key, resolve_model_name
@@ -28,6 +37,10 @@ async def lifespan(app: FastAPI):
         logger.critical(f"[STARTUP FATAL] {message}")
         raise RuntimeError(message)
     logger.info(f"[STARTUP] AI model: {model_name}")
+    logger.info(
+        f"[STARTUP] Business list {os.environ.get('TENANTS_CONFIG_PATH', 'config/tenants.yaml')}: "
+        f"{len(tenant_directory.tenants)} businesses, {len(tenant_directory.phone_to_tenant)} phone numbers"
+    )
     try:
         # Replay any pending messages left unfinished across tenants after a restart
         await replay_all_pending_messages()
