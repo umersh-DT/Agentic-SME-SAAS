@@ -38,6 +38,7 @@ os.environ.update(
         "TENANTS_DATA_DIR": os.path.join(WORK_DIR, "tenants"),
         "TENANTS_CONFIG_PATH": os.path.join(WORK_DIR, "tenants.yaml"),
         "ALERT_EMAIL": "",
+        "LLM_MODEL": "gemini/gemini-2.5-flash",
         "PLATFORM_ALERT_WHATSAPP": "",
     }
 )
@@ -156,6 +157,7 @@ def main():
     print("\n--- Stored for Luxe Curtain Interiors ---")
     print("messages:", [tuple(r) for r in statuses])
     print("invoice:", tuple(invoice))
+    print(f"AI model: {os.environ['LLM_MODEL']}")
     print(f"AI usage recorded: {usage['n']} turns, {usage['t']} tokens, ${usage['c']:.6f}")
     shutil.rmtree(WORK_DIR)
 

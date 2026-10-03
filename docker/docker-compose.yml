@@ -23,7 +23,10 @@ services:
       - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
       - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:?set TWILIO_WHATSAPP_NUMBER in .env}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      # AI model; the app refuses to start if the key for the chosen model is missing.
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o-mini}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - ALERT_EMAIL=${ALERT_EMAIL:?set ALERT_EMAIL in .env}
       - SMTP_USER=${SMTP_USER:?set SMTP_USER in .env}
       - SMTP_PASSWORD=${SMTP_PASSWORD:?set SMTP_PASSWORD in .env}
@@ -36,7 +39,8 @@ services:
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
       # Optional second alert channel (WhatsApp) in addition to email.
       - PLATFORM_ALERT_WHATSAPP=${PLATFORM_ALERT_WHATSAPP:-}
-      - TENANTS_CONFIG_PATH=/app/config/tenants.yaml
+      # Business list file inside config/. Use tenants.local.yaml for real numbers (kept out of git).
+      - TENANTS_CONFIG_PATH=/app/config/${TENANTS_FILE:-tenants.yaml}
       - TENANTS_DATA_DIR=/app/data/tenants
     volumes:
       - ../config:/app/config

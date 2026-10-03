@@ -1,6 +1,8 @@
 # Stage 3 Global Configuration: LiteLLM Agent Loop, Token Metering & Guardrails
 
 llm:
+  # Default model. Override per server with LLM_MODEL in .env, e.g. LLM_MODEL=gemini/gemini-2.5-flash
+  # (OpenAI models need OPENAI_API_KEY, Gemini models need GEMINI_API_KEY).
   model: "openai/gpt-4o-mini"
   temperature: 0.2
   max_tokens: 800
@@ -18,10 +20,23 @@ quotas_usd_monthly:
   pro: 20.00
   enterprise: 100.00
 
-# Pricing in USD per 1M tokens (e.g. gpt-4o-mini rates)
+# Pricing in USD per 1M tokens, used to record cost per business.
+# Fallback rates (gpt-4o-mini) apply to any model not listed below.
 pricing_per_1m_tokens:
   prompt_usd: 0.150
   completion_usd: 0.600
+
+# Per-model rates; check the provider's pricing page when changing models.
+pricing_per_1m_tokens_by_model:
+  "openai/gpt-4o-mini":
+    prompt_usd: 0.150
+    completion_usd: 0.600
+  "gemini/gemini-2.5-flash":
+    prompt_usd: 0.300
+    completion_usd: 2.500
+  "gemini/gemini-2.5-flash-lite":
+    prompt_usd: 0.100
+    completion_usd: 0.400
 
 whatsapp:
   max_message_chars: 1550

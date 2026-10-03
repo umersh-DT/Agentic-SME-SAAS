@@ -1,7 +1,8 @@
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import litellm
@@ -15,6 +16,30 @@ from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.alerts import send_platform_alert
 
 logger = logging.getLogger("agent_loop")
+
+# API key environment variable each model provider needs (LiteLLM reads these directly).
+PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+
+
+def resolve_model_name(settings: Dict[str, Any]) -> str:
+    """Model from LLM_MODEL in the environment, else config/default_settings.yaml."""
+    return (os.getenv("LLM_MODEL") or "").strip() or settings.get("llm", {}).get("model", "openai/gpt-4o-mini")
+
+
+def resolve_pricing(settings: Dict[str, Any], model_name: str) -> Tuple[float, float]:
+    """(prompt, completion) USD per 1M tokens for the model, falling back to the default rates."""
+    rates = settings.get("pricing_per_1m_tokens_by_model", {}).get(model_name) or settings.get(
+        "pricing_per_1m_tokens", {}
+    )
+    return float(rates.get("prompt_usd", 0.150)), float(rates.get("completion_usd", 0.600))
+
+
+def missing_model_api_key(model_name: str) -> Optional[str]:
+    """Name of the API key variable the model needs but is not set, or None if it is set."""
+    key_env = PROVIDER_KEY_ENV.get(model_name.split("/", 1)[0])
+    if key_env and not os.getenv(key_env, "").strip():
+        return key_env
+    return None
 
 
 class LiteLLMAgent:
@@ -178,14 +203,12 @@ class LiteLLMAgent:
             )
 
             llm_cfg = self.settings.get("llm", {})
-            model_name = llm_cfg.get("model", "openai/gpt-4o-mini")
+            model_name = resolve_model_name(self.settings)
             timeout_seconds = llm_cfg.get("timeout_seconds", 25)
             max_output_tokens = llm_cfg.get("max_tokens", 800)
             max_tool_rounds = llm_cfg.get("max_tool_rounds", 4)
 
-            pricing = self.settings.get("pricing_per_1m_tokens", {})
-            prompt_rate = pricing.get("prompt_usd", 0.150)
-            completion_rate = pricing.get("completion_usd", 0.600)
+            prompt_rate, completion_rate = resolve_pricing(self.settings, model_name)
 
             accumulated_prompt_tokens = 0
             accumulated_completion_tokens = 0

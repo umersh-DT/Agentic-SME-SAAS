@@ -10,6 +10,8 @@ from src.gateway.twilio_webhook import (
     replay_all_pending_messages,
 )
 from src.gateway.stripe_billing import router as stripe_router
+from src.core.agent_loop import missing_model_api_key, resolve_model_name
+from src.core.storage_models import load_default_settings
 
 logger = logging.getLogger("gateway_main")
 
@@ -18,6 +20,14 @@ logger = logging.getLogger("gateway_main")
 async def lifespan(app: FastAPI):
     """Handles startup recovery tasks and graceful teardown."""
     logger.info("[STARTUP] Initializing Agentic SaaS Gateway lifespan...")
+    model_name = resolve_model_name(load_default_settings())
+    missing_key = missing_model_api_key(model_name)
+    if missing_key:
+        # Refuse to start rather than answer every message with an error.
+        message = f"AI model '{model_name}' needs {missing_key}, which is not set. Add it to .env."
+        logger.critical(f"[STARTUP FATAL] {message}")
+        raise RuntimeError(message)
+    logger.info(f"[STARTUP] AI model: {model_name}")
     try:
         # Replay any pending messages left unfinished across tenants after a restart
         await replay_all_pending_messages()

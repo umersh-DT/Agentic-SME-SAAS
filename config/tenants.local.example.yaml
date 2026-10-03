@@ -1,0 +1,23 @@
+# Copy to config/tenants.local.yaml on the server, put real numbers in, and set
+# TENANTS_FILE=tenants.local.yaml in .env. That file is ignored by git.
+#
+# Each business: one owner (can teach rules) and any number of staff (can ask and draft invoices).
+# Phone numbers in full international format: + country code + number, no spaces.
+# A phone number can belong to only one business.
+tenants:
+  - tenant_id: "tenant_demo_001"          # lowercase letters, digits, underscores; must start with tenant_
+    business_name: "Demo Curtains"
+    plan_tier: "starter"
+    subscription_status: "active"
+    owner_phone: "+971500000001"          # replace with the owner's WhatsApp number
+    staff_phones:
+      - "+971500000002"                   # replace or remove
+    enabled_skills: ["invoicing", "memory_tree"]
+
+  - tenant_id: "tenant_demo_002"
+    business_name: "Demo Photography"
+    plan_tier: "starter"
+    subscription_status: "active"
+    owner_phone: "+971500000003"
+    staff_phones: []
+    enabled_skills: ["invoicing", "memory_tree"]

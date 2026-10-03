@@ -30,7 +30,7 @@ class TestDeploymentConfig(unittest.TestCase):
         env = dict(item.split("=", 1) for item in self.gateway["environment"])
         for name in [
             "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_NUMBER",
-            "OPENAI_API_KEY", "ALERT_EMAIL", "SMTP_USER", "SMTP_PASSWORD",
+            "ALERT_EMAIL", "SMTP_USER", "SMTP_PASSWORD",
         ]:
             self.assertRegex(env[name], rf"^\$\{{{name}:\?", f"{name} must be required")
         caddy_env = dict(item.split("=", 1) for item in self.caddy["environment"])
@@ -46,6 +46,13 @@ class TestDeploymentConfig(unittest.TestCase):
         self.assertIn("/metrics/*", blocked)
         self.assertIn("respond @internal", caddyfile)
         self.assertIn("reverse_proxy gateway:8000", caddyfile)
+
+    def test_model_and_business_list_are_chosen_in_env(self):
+        env = dict(item.split("=", 1) for item in self.gateway["environment"])
+        self.assertEqual(env["LLM_MODEL"], "${LLM_MODEL:-openai/gpt-4o-mini}")
+        self.assertEqual(env["GEMINI_API_KEY"], "${GEMINI_API_KEY:-}")
+        self.assertEqual(env["TENANTS_CONFIG_PATH"], "/app/config/${TENANTS_FILE:-tenants.yaml}")
+        self.assertIn("config/tenants.local.yaml", (REPO_ROOT / ".gitignore").read_text().splitlines())
 
     def test_unused_packages_removed(self):
         packages = [

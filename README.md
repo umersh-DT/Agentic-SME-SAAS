@@ -113,6 +113,14 @@ python -m unittest discover -s tests -t .
    chmod 600 .env
    nano .env        # fill in every REQUIRED value
    ```
+   * **AI model:** set `LLM_MODEL` and the matching key — e.g. `LLM_MODEL=gemini/gemini-2.5-flash` with
+     `GEMINI_API_KEY`, or `LLM_MODEL=openai/gpt-4o-mini` with `OPENAI_API_KEY`. The app will not start
+     if the key for the chosen model is missing.
+   * **Businesses and phone numbers:** `cp config/tenants.local.example.yaml config/tenants.local.yaml`,
+     put the real numbers in, and set `TENANTS_FILE=tenants.local.yaml` in `.env`. This file is never
+     committed to git. Restart the app after editing it.
+   * **No domain yet?** Use the free address `DOMAIN=<server-ip-with-dashes>.sslip.io`
+     (e.g. `167-233-67-253.sslip.io`); Caddy gets a real HTTPS certificate for it.
 2. Start the app behind Caddy (HTTPS is obtained automatically for `DOMAIN`):
    ```bash
    docker compose --env-file .env -f docker/docker-compose.yml up -d --build
