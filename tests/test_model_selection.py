@@ -69,5 +69,43 @@ class TestModelSelection(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(row["cost_usd"], 2.80, places=6)
 
 
+class TestRateLimits(unittest.IsolatedAsyncioTestCase):
+    def _rate_limit(self):
+        return litellm.RateLimitError(
+            message='geminiException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", '
+                    '"details": [{"retryDelay": "12s"}]}}',
+            llm_provider="gemini", model="gemini-2.5-flash",
+        )
+
+    async def _turn(self, side_effect):
+        with tempfile.TemporaryDirectory() as data_dir:
+            agent = LiteLLMAgent(tenant_id="tenant_rl_01", base_data_dir=data_dir)
+            reply_skill = MagicMock(spec=WhatsAppReplySkill)
+            reply_skill.send_reply = AsyncMock(return_value={"success": True, "message_sid": "SM_ok"})
+            sleep = AsyncMock()
+            with patch("litellm.acompletion", AsyncMock(side_effect=side_effect)) as mock_llm, \
+                 patch("src.core.agent_loop.asyncio.sleep", sleep):
+                result = await agent.process_user_turn(
+                    message_sid="SM_rl", from_number="+971501234567", user_message="Hi", reply_skill=reply_skill)
+            spend = await TenantDatabaseManager("tenant_rl_01", base_dir=data_dir).get_current_month_cost()
+        return result, mock_llm, sleep, reply_skill, spend
+
+    async def test_one_rate_limit_is_retried_after_suggested_wait(self):
+        message = SimpleNamespace(content="Hello!", tool_calls=None, to_dict=lambda: {"role": "assistant", "content": "Hello!"})
+        ok = SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2))
+        result, mock_llm, sleep, reply_skill, _ = await self._turn([self._rate_limit(), ok])
+        self.assertEqual(result["reply"], "Hello!")
+        self.assertEqual(mock_llm.call_count, 2)
+        sleep.assert_awaited_once_with(12.0)
+
+    async def test_repeated_rate_limit_gives_busy_reply(self):
+        result, mock_llm, _, reply_skill, spend = await self._turn([self._rate_limit(), self._rate_limit()])
+        self.assertEqual(result["reply"], "The AI service is busy right now. Please try again in a minute.")
+        self.assertEqual(reply_skill.send_reply.call_args.kwargs["message"],
+                         "The AI service is busy right now. Please try again in a minute.")
+        self.assertEqual(spend, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import re
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +19,20 @@ from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.alerts import send_platform_alert
 
 logger = logging.getLogger("agent_loop")
+
+BUSY_REPLY = "The AI service is busy right now. Please try again in a minute."
+MAX_RATE_LIMIT_WAIT_SECONDS = 30
+
+
+def rate_limit_wait_seconds(error: Exception, default: float = 10.0) -> float:
+    """Wait suggested by the provider (e.g. Gemini's "retryDelay": "31s"), capped to keep replies timely."""
+    text = str(error)
+    match = re.search(r'retryDelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s', text) or re.search(
+        r"(?:retry|try again) in (\d+(?:\.\d+)?)\s*s", text, re.IGNORECASE
+    )
+    wait = float(match.group(1)) if match else default
+    return min(wait, MAX_RATE_LIMIT_WAIT_SECONDS)
+
 
 # API key environment variable each model provider needs (LiteLLM reads these directly).
 PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
@@ -251,8 +266,8 @@ class LiteLLMAgent:
             while current_round < max_tool_rounds:
                 current_round += 1
 
-                try:
-                    response = await asyncio.wait_for(
+                async def _call_model():
+                    return await asyncio.wait_for(
                         litellm.acompletion(
                             model=model_name,
                             messages=messages,
@@ -263,6 +278,26 @@ class LiteLLMAgent:
                         ),
                         timeout=timeout_seconds,
                     )
+
+                try:
+                    try:
+                        response = await _call_model()
+                    except litellm.RateLimitError as rate_err:
+                        # Provider usage limit (e.g. Gemini free tier): wait as advised, retry once.
+                        wait = rate_limit_wait_seconds(rate_err)
+                        logger.warning(
+                            f"[AGENT RATE LIMIT] Tenant={self.tenant_id} model={model_name} hit the provider's "
+                            f"usage limit; retrying once in {wait:.0f}s."
+                        )
+                        await asyncio.sleep(wait)
+                        response = await _call_model()
+                except litellm.RateLimitError:
+                    logger.error(
+                        f"[AGENT RATE LIMIT] Tenant={self.tenant_id} model={model_name} still over the provider's "
+                        f"usage limit (free tier?). Replying that the service is busy."
+                    )
+                    final_reply_text = BUSY_REPLY
+                    break
                 except asyncio.TimeoutError:
                     logger.error(
                         f"[AGENT TIMEOUT] Tenant={self.tenant_id} exceeded {timeout_seconds}s limit."
