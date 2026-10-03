@@ -55,7 +55,7 @@ The platform operates across four automated layers:
                   └─────────────────────────────────────┘
 ```
 
-1. **WhatsApp-Native Gateway (`src/gateway/`):** Inbound voice notes and messages flow via Twilio/WhatsApp Cloud API directly to the tenant's agent. Zero client learning curve.
+1. **WhatsApp-Native Gateway (`src/gateway/`):** Inbound voice notes and messages flow via Meta's official WhatsApp Cloud API directly to the tenant's agent. Zero client learning curve.
 2. **Multi-Tenant Isolation (`docker/`, `data/tenants/`):** Dedicated SQLite databases for every tenant. Client A cannot see Client B's appointments, customer data, or invoices.
 3. **Pre-Bundled Skills Engine (`src/skills/`):** Out-of-the-box business capabilities:
    * **Smart Calendar Sync:** Bi-directional sync with Google Calendar and Cal.com.
@@ -81,7 +81,7 @@ Agentic-SME-SAAS/
 │   └── docker-compose.yml     # Multi-tenant network orchestrator
 ├── src/
 │   ├── core/                  # OpenHuman execution loop & LLM proxy
-│   ├── gateway/               # WhatsApp / Twilio ingress controllers
+│   ├── gateway/               # WhatsApp Cloud API ingress controllers
 │   ├── skills/                # Pre-bundled plugins (Calendar, Invoice, SEO, etc.)
 │   └── utils/                 # Structured logging, crypto, and telemetry
 ├── PROJECT_STATE.md           # Master ground-truth document for AI grounding
@@ -95,7 +95,7 @@ Agentic-SME-SAAS/
 ### Prerequisites
 * A Linux server with Docker & Docker Compose v2+, ports 80 and 443 open
 * A domain name whose DNS `A` record points at the server (needed for HTTPS)
-* Twilio WhatsApp credentials and an OpenAI API key
+* A Meta developer app with WhatsApp (token, phone number ID, app secret) and a Gemini or OpenAI API key
 * An email account to send alerts from (a Gmail "App password" works)
 
 ### Run the tests locally
@@ -129,7 +129,9 @@ python -m unittest discover -s tests -t .
    The app itself is not published on any host port; only Caddy listens on 80/443,
    and `/metrics` is not reachable from the internet.
 3. Check it: `curl https://YOUR_DOMAIN/health` should return `"status": "healthy"`.
-4. In Twilio, set the WhatsApp inbound webhook to `https://YOUR_DOMAIN/webhook/whatsapp` (POST).
+4. In Meta (developers.facebook.com → your app → WhatsApp → Configuration → Webhook):
+   Callback URL `https://YOUR_DOMAIN/webhook/whatsapp`, Verify token = `WHATSAPP_VERIFY_TOKEN` from `.env`,
+   click **Verify and save**, then subscribe to the **messages** field.
 5. Send a test alert email:
    ```bash
    docker compose --env-file .env -f docker/docker-compose.yml exec gateway python -m src.utils.alerts --test

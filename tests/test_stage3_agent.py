@@ -49,19 +49,19 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
 
-    def test_message_splitting_1550_chars(self):
+    def test_message_splitting_respects_limit(self):
         short_text = "Hello from WhatsApp!"
-        self.assertEqual(split_message_text(short_text, max_chars=1550), [short_text])
+        self.assertEqual(split_message_text(short_text, max_chars=4096), [short_text])
 
-        para1 = "Paragraph 1: " + ("A" * 1200)
-        para2 = "Paragraph 2: " + ("B" * 1200)
-        para3 = "Paragraph 3: " + ("C" * 1200)
+        para1 = "Paragraph 1: " + ("A" * 3000)
+        para2 = "Paragraph 2: " + ("B" * 3000)
+        para3 = "Paragraph 3: " + ("C" * 3000)
         combined = f"{para1}\n\n{para2}\n\n{para3}"
 
-        chunks = split_message_text(combined, max_chars=1550)
+        chunks = split_message_text(combined, max_chars=4096)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
-            self.assertLessEqual(len(c), 1550)
+            self.assertLessEqual(len(c), 4096)
 
     def test_tools_tenant_id_not_exposed_in_schema(self):
         """Verifies tenant_id is NEVER in tool schema but present in bound callables."""
@@ -345,7 +345,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
 
         mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
         mock_reply_skill.send_reply = AsyncMock(
-            return_value={"success": False, "error": "Twilio fatal 400"}
+            return_value={"success": False, "error": "WhatsApp API fatal error 400"}
         )
 
         mock_resp = MagicMock()

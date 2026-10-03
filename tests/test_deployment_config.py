@@ -29,7 +29,7 @@ class TestDeploymentConfig(unittest.TestCase):
     def test_secrets_are_required(self):
         env = dict(item.split("=", 1) for item in self.gateway["environment"])
         for name in [
-            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_NUMBER",
+            "WHATSAPP_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN",
             "ALERT_EMAIL", "SMTP_USER", "SMTP_PASSWORD",
         ]:
             self.assertRegex(env[name], rf"^\$\{{{name}:\?", f"{name} must be required")
@@ -62,7 +62,15 @@ class TestDeploymentConfig(unittest.TestCase):
         ]
         self.assertNotIn("openhuman", packages)
         self.assertNotIn("asyncio", packages)
+        self.assertNotIn("twilio", packages)
         self.assertEqual(len(packages), len(set(packages)), "duplicate package lines")
+
+    def test_no_twilio_left_in_app_code_or_settings(self):
+        paths = list((REPO_ROOT / "src").rglob("*.py")) + [
+            REPO_ROOT / "docker" / "docker-compose.yml", REPO_ROOT / ".env.example", REPO_ROOT / "requirements.txt",
+        ]
+        for path in paths:
+            self.assertNotIn("twilio", path.read_text().lower(), str(path))
 
     def test_alert_email_comes_from_env_not_code(self):
         example = (REPO_ROOT / ".env.example").read_text()

@@ -1,11 +1,10 @@
-import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
-from typing import Dict, Optional, Set
-from urllib.parse import parse_qsl
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Response
 import yaml
@@ -15,9 +14,9 @@ from src.gateway.dispatcher import TenantWorkerDispatcher
 from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.security import TenantConfig, describe_error_safely, mask_phone_number, normalize_phone_number
 
-logger = logging.getLogger("gateway_twilio")
+logger = logging.getLogger("gateway_whatsapp")
 
-router = APIRouter(prefix="/webhook", tags=["Twilio Ingress"])
+router = APIRouter(prefix="/webhook", tags=["WhatsApp Cloud API Ingress"])
 
 
 class DeduplicationCache:
@@ -131,15 +130,45 @@ class StrictTenantDirectory:
 tenant_directory = StrictTenantDirectory()
 
 
-def verify_twilio_signature(url: str, post_data: bytes, signature: str, auth_token: str) -> bool:
-    if not auth_token:
+NOT_REGISTERED_NOTICE = (
+    "This phone number is not registered with an active business assistant. "
+    "Please contact your business administrator."
+)
+
+# Message types that carry media; voice notes are handled in a later step.
+MEDIA_MESSAGE_TYPES = {"audio", "voice", "image", "video", "document", "sticker"}
+
+
+def verify_meta_signature(raw_body: bytes, signature_header: Optional[str], app_secret: str) -> bool:
+    """Checks X-Hub-Signature-256 ("sha256=<hex>") = HMAC-SHA256 of the raw body with the app secret."""
+    if not app_secret or not signature_header or not signature_header.startswith("sha256="):
         return False
-    data_dict = dict(parse_qsl(post_data.decode("utf-8", errors="ignore"), keep_blank_values=True))
-    concatenated = url + "".join(f"{k}{v}" for k, v in sorted(data_dict.items()))
-    computed = base64.b64encode(
-        hmac.new(auth_token.encode("utf-8"), concatenated.encode("utf-8"), hashlib.sha1).digest()
-    ).decode("utf-8")
-    return hmac.compare_digest(computed, signature)
+    expected = hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header[len("sha256="):].strip())
+
+
+def to_e164(wa_id: str) -> str:
+    """Meta sends sender numbers as digits without '+' (e.g. 971501234567); routing uses E.164."""
+    digits = normalize_phone_number(wa_id).lstrip("+")
+    return f"+{digits}" if digits else ""
+
+
+def extract_inbound_messages(payload: Dict[str, Any], phone_number_id: str) -> List[Dict[str, Any]]:
+    """Returns the user messages in a webhook payload; status updates and other numbers are ignored."""
+    messages: List[Dict[str, Any]] = []
+    if payload.get("object") != "whatsapp_business_account":
+        return messages
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            if change.get("field") != "messages":
+                continue
+            value = change.get("value") or {}
+            metadata_number_id = str((value.get("metadata") or {}).get("phone_number_id", ""))
+            if phone_number_id and metadata_number_id and metadata_number_id != phone_number_id:
+                logger.warning("[WEBHOOK] Ignoring payload for a different WhatsApp phone number id.")
+                continue
+            messages.extend(value.get("messages") or [])
+    return messages
 
 
 async def replay_all_pending_messages(base_data_dir: Optional[str] = None) -> None:
@@ -159,80 +188,78 @@ async def replay_all_pending_messages(base_data_dir: Optional[str] = None) -> No
             logger.error(f"[STARTUP REPLAY ERROR] Tenant={tenant_id} replay failed: {e}")
 
 
-@router.post("/whatsapp")
-async def handle_whatsapp_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_twilio_signature: Optional[str] = Header(None, alias="X-Twilio-Signature"),
-):
-    """Twilio WhatsApp Inbound Webhook handler."""
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+@router.get("/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    """Meta webhook verification: echo hub.challenge when hub.verify_token matches."""
+    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token", "")
+    challenge = params.get("hub.challenge", "")
 
-    if not auth_token:
-        logger.error("[SECURITY] TWILIO_AUTH_TOKEN is unset. Rejecting webhook (fail-closed).")
-        raise HTTPException(status_code=403, detail="Webhook authentication is unconfigured.")
+    if not verify_token:
+        logger.error("[SECURITY] WHATSAPP_VERIFY_TOKEN is unset. Rejecting verification (fail-closed).")
+        raise HTTPException(status_code=403, detail="Webhook verification is unconfigured.")
+    if mode == "subscribe" and hmac.compare_digest(token, verify_token):
+        logger.info("[WEBHOOK] Meta webhook verified.")
+        return Response(content=challenge, media_type="text/plain")
+    logger.warning("[SECURITY] Meta webhook verification failed (bad mode or token).")
+    raise HTTPException(status_code=403, detail="Verification failed.")
 
-    raw_body = await request.body()
-    effective_url = str(request.url)
 
-    if not x_twilio_signature or not verify_twilio_signature(effective_url, raw_body, x_twilio_signature, auth_token):
-        logger.warning("[SECURITY] Invalid Twilio signature")
-        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+async def _handle_inbound_message(message: Dict[str, Any], background_tasks: BackgroundTasks) -> str:
+    """Routes one inbound message. Returns what happened (for logs and tests)."""
+    message_id = str(message.get("id", ""))
+    from_number = to_e164(str(message.get("from", "")))
+    msg_type = message.get("type", "")
+    if not message_id or not from_number:
+        return "ignored_malformed"
 
-    form_params = dict(parse_qsl(raw_body.decode("utf-8", errors="ignore"), keep_blank_values=True))
-    from_number = form_params.get("From", "")
-    body_text = form_params.get("Body", "").strip()
-    message_sid = form_params.get("MessageSid", "")
-    num_media = int(form_params.get("NumMedia", "0"))
+    # 1. In-memory deduplication (Meta retries deliveries)
+    if dedup_cache.is_duplicate(message_id):
+        logger.warning(f"[DEDUP] Dropping duplicate WhatsApp message id={message_id}")
+        return "duplicate"
 
-    if not message_sid:
-        return Response(content="<Response></Response>", media_type="application/xml")
-
-    # 1. In-Memory Deduplication Check
-    if dedup_cache.is_duplicate(message_sid):
-        logger.warning(f"[DEDUP] Dropping duplicate Twilio message MessageSid={message_sid}")
-        return Response(content="<Response></Response>", media_type="application/xml", headers={"X-Dedup-Dropped": "true"})
-
-    # 2. Strict Sender Resolution & Masked Logging
+    # 2. Strict sender resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
-        masked_sender = mask_phone_number(from_number)
-        logger.warning(f"[ROUTING REJECT] Unregistered sender: {masked_sender}.")
+        logger.warning(f"[ROUTING REJECT] Unregistered sender: {mask_phone_number(from_number)}.")
         if rejection_limiter.should_reply(from_number):
-            rejection_twiml = (
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                "<Response>\n"
-                "  <Message>This phone number is not registered with an active business assistant. "
-                "Please contact your business administrator.</Message>\n"
-                "</Response>"
-            )
-            return Response(content=rejection_twiml, media_type="application/xml")
-        return Response(content="<Response></Response>", media_type="application/xml")
+            background_tasks.add_task(reply_skill.send_reply, to_number=from_number, message=NOT_REGISTERED_NOTICE)
+            return "unregistered_notified"
+        return "unregistered_silent"
 
     tenant_config = tenant_directory.tenants[tenant_id]
+    body_text = ((message.get("text") or {}).get("body") or "").strip() if msg_type == "text" else ""
+    is_media = msg_type in MEDIA_MESSAGE_TYPES
 
-    # 3. Crash Replay Safety: Persist inbound message BEFORE acknowledging Twilio
+    if not body_text and not is_media:
+        # Reactions, location pins, button taps etc. are not handled yet.
+        logger.info(f"[WEBHOOK] Ignoring unsupported message type '{msg_type}' for tenant={tenant_id}.")
+        return "ignored_type"
+
+    # 3. Crash replay safety: persist before acknowledging Meta
     base_data_dir = os.environ.get("TENANTS_DATA_DIR", "/app/data/tenants")
     db_manager = TenantDatabaseManager(tenant_id=tenant_id, base_dir=base_data_dir)
     await db_manager.persist_inbound_message(
-        message_sid=message_sid,
+        message_sid=message_id,
         from_number=from_number,
         body=body_text,
-        num_media=num_media,
+        num_media=1 if is_media else 0,
     )
 
-    # 4. Media-Only Message Intercept: Mark completed and reply with advisory
-    if num_media > 0 and not body_text:
+    # 4. Media messages: advisory reply for now
+    if is_media:
         settings = load_default_settings()
         media_msg = settings.get("whatsapp", {}).get(
             "media_fallback_reply",
             "Voice notes and media messages are coming soon! Please text your request for now.",
         )
-        await db_manager.update_message_status(message_sid, "completed")
+        await db_manager.update_message_status(message_id, "completed")
         background_tasks.add_task(reply_skill.send_reply, to_number=from_number, message=media_msg)
-        return Response(content="<Response></Response>", media_type="application/xml")
+        return "media_advisory"
 
-    # 5. Hand off to Agent Loop via BackgroundTasks (DB check inside dispatcher drops stale retries)
+    # 5. Hand off to the agent loop after acknowledging (dispatcher drops stale retries)
     background_tasks.add_task(
         dispatcher.process_incoming_message,
         tenant_id=tenant_id,
@@ -241,7 +268,37 @@ async def handle_whatsapp_webhook(
         owner_phone=tenant_config.owner_phone,
         from_number=from_number,
         body=body_text,
-        message_sid=message_sid,
+        message_sid=message_id,
     )
+    return "dispatched"
 
-    return Response(content="<Response></Response>", media_type="application/xml")
+
+@router.post("/whatsapp")
+async def handle_whatsapp_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: Optional[str] = Header(None, alias="X-Hub-Signature-256"),
+):
+    """WhatsApp Cloud API inbound webhook handler."""
+    app_secret = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+    if not app_secret:
+        logger.error("[SECURITY] WHATSAPP_APP_SECRET is unset. Rejecting webhook (fail-closed).")
+        raise HTTPException(status_code=403, detail="Webhook authentication is unconfigured.")
+
+    raw_body = await request.body()
+    if not verify_meta_signature(raw_body, x_hub_signature_256, app_secret):
+        logger.warning("[SECURITY] Invalid X-Hub-Signature-256")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.error("[WEBHOOK] Signed payload is not valid JSON; acknowledging to stop retries.")
+        return {"status": "ignored_bad_json"}
+
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    outcomes = []
+    for message in extract_inbound_messages(payload, phone_number_id):
+        outcomes.append(await _handle_inbound_message(message, background_tasks))
+
+    return {"status": "ok", "messages": outcomes}

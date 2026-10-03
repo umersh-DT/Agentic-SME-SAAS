@@ -22,8 +22,10 @@ class TenantWorkerDispatcher:
 
     def __init__(self, data_root: str = "/app/data/tenants"):
         self.data_root = os.environ.get("TENANTS_DATA_DIR", data_root)
-        self.reply_skill = WhatsAppReplySkill()
         self.settings = load_default_settings()
+        self.reply_skill = WhatsAppReplySkill(
+            max_chars=self.settings.get("whatsapp", {}).get("max_message_chars")
+        )
 
     async def _handle_business_rule(
         self, tenant_id: str, body: str, message_sid: str, is_owner: bool

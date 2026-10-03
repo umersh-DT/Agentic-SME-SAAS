@@ -20,9 +20,12 @@ services:
       - "8000"
     environment:
       - PYTHONPATH=/app
-      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
-      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
-      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:?set TWILIO_WHATSAPP_NUMBER in .env}
+      # Meta WhatsApp Cloud API
+      - WHATSAPP_TOKEN=${WHATSAPP_TOKEN:?set WHATSAPP_TOKEN in .env}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID:?set WHATSAPP_PHONE_NUMBER_ID in .env}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET:?set WHATSAPP_APP_SECRET in .env}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN:?set WHATSAPP_VERIFY_TOKEN in .env}
+      - WHATSAPP_GRAPH_API_VERSION=${WHATSAPP_GRAPH_API_VERSION:-v23.0}
       # AI model; the app refuses to start if the key for the chosen model is missing.
       - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o-mini}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}

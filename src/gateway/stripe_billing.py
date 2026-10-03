@@ -146,7 +146,7 @@ def register_tenant_in_yaml(
     data["tenants"] = tenants
     atomic_write_yaml(config_file, data)
 
-    from src.gateway.twilio_webhook import tenant_directory
+    from src.gateway.whatsapp_webhook import tenant_directory
     tenant_directory.reload_tenants()
 
 
@@ -220,7 +220,7 @@ async def handle_stripe_webhook(
             logger.error(f"[STRIPE CUSTOMER DEFECT] Invalid tenant configuration for {tenant_id}: {detail}.")
             return Response(content=json.dumps({"status": "ignored_invalid_customer_data", "detail": detail}), media_type="application/json")
 
-        from src.gateway.twilio_webhook import tenant_directory
+        from src.gateway.whatsapp_webhook import tenant_directory
 
         # CONDITION 1: If tenant_id already exists, prevent phone modification / hijacking
         if tenant_id in tenant_directory.tenants:

@@ -1,16 +1,17 @@
 """Simulated WhatsApp conversation against the real app.
 
-Runs the real FastAPI app, webhook signature checks, routing, dispatcher, business memory,
-invoicing tools and SQLite storage. Only two things are stubbed:
+Runs the real FastAPI app with Meta WhatsApp Cloud API webhooks (verification, X-Hub-Signature-256
+checks, routing, dispatcher, business memory, invoicing tools and SQLite storage).
+Only two things are stubbed:
   * the AI model (litellm.acompletion) - a tiny scripted stand-in, no API key needed
-  * the outbound WhatsApp HTTP call - captured and printed instead of sent
+  * the outbound Graph API HTTP call - captured and printed instead of sent
 
 Usage:  python scripts/simulate_conversation.py
 """
-import base64
 import hashlib
 import hmac
 import json
+import json as json_module
 import os
 import re
 import shutil
@@ -24,7 +25,9 @@ sys.path.insert(0, REPO_ROOT)
 os.chdir(REPO_ROOT)
 
 WORK_DIR = tempfile.mkdtemp(prefix="wa_sim_")
-AUTH_TOKEN = "simulated_twilio_auth_token"
+APP_SECRET = "simulated_meta_app_secret"
+VERIFY_TOKEN = "simulated_verify_token"
+PHONE_NUMBER_ID = "109876543210"
 OWNER = "+971501234567"   # Luxe Curtain Interiors owner (config/tenants.yaml)
 STAFF = "+971502223344"   # staff member added for this simulation
 STRANGER = "+447700900123"
@@ -32,9 +35,10 @@ STRANGER = "+447700900123"
 # Settings must exist before the app modules are imported.
 os.environ.update(
     {
-        "TWILIO_AUTH_TOKEN": AUTH_TOKEN,
-        "TWILIO_ACCOUNT_SID": "ACsimulated000000000000000000000000",
-        "TWILIO_WHATSAPP_NUMBER": "+14155238886",
+        "WHATSAPP_APP_SECRET": APP_SECRET,
+        "WHATSAPP_VERIFY_TOKEN": VERIFY_TOKEN,
+        "WHATSAPP_TOKEN": "simulated_access_token",
+        "WHATSAPP_PHONE_NUMBER_ID": PHONE_NUMBER_ID,
         "TENANTS_DATA_DIR": os.path.join(WORK_DIR, "tenants"),
         "TENANTS_CONFIG_PATH": os.path.join(WORK_DIR, "tenants.yaml"),
         "ALERT_EMAIL": "",
@@ -62,9 +66,8 @@ import httpx  # noqa: E402
 
 from src.core.storage_models import TenantDatabaseManager  # noqa: E402
 from src.gateway.main import app  # noqa: E402
-from src.gateway.twilio_webhook import dispatcher, tenant_directory  # noqa: E402
+from src.gateway.whatsapp_webhook import dispatcher, tenant_directory  # noqa: E402
 
-WEBHOOK_URL = "http://testserver/webhook/whatsapp"
 outbox = []
 
 
@@ -108,46 +111,62 @@ async def fake_ai(model, messages, **kwargs):
     return SimpleNamespace(choices=[SimpleNamespace(message=reply)], usage=usage)
 
 
-# ---------------- Stub 2: outbound WhatsApp HTTP ----------------
-async def fake_twilio_post(self, url, data=None, auth=None, **kwargs):
-    outbox.append(data)
-    return httpx.Response(201, json={"sid": f"SM_out_{len(outbox)}"}, request=httpx.Request("POST", url))
+# ---------------- Stub 2: outbound WhatsApp (Graph API) HTTP ----------------
+async def fake_graph_post(self, url, json=None, headers=None, **kwargs):
+    outbox.append({"url": url, "payload": json, "auth": (headers or {}).get("Authorization", "")})
+    return httpx.Response(200, json={"messages": [{"id": f"wamid.out_{len(outbox)}"}]},
+                          request=httpx.Request("POST", url))
 
 
-def signed_post(client, sender, body, sid):
-    params = {"From": f"whatsapp:{sender}", "To": "whatsapp:+14155238886", "Body": body, "MessageSid": sid}
-    concatenated = WEBHOOK_URL + "".join(f"{k}{v}" for k, v in sorted(params.items()))
-    signature = base64.b64encode(hmac.new(AUTH_TOKEN.encode(), concatenated.encode(), hashlib.sha1).digest()).decode()
-    return client.post("/webhook/whatsapp", data=params, headers={"X-Twilio-Signature": signature})
+def signed_post(client, sender, message):
+    """Posts a Meta-format webhook (sender digits without '+') signed with the app secret."""
+    body = json_module.dumps({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "WABA", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {"display_phone_number": "15550001111", "phone_number_id": PHONE_NUMBER_ID},
+            "messages": [dict({"from": sender.lstrip("+"), "timestamp": "1730000000"}, **message)],
+        }}]}],
+    }).encode()
+    signature = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return client.post("/webhook/whatsapp", content=body,
+                       headers={"X-Hub-Signature-256": signature, "Content-Type": "application/json"})
 
 
-def show(label, sender, body, response):
-    print(f"\n[{label} {sender}] > {body}")
-    twiml = re.search(r"<Message>(.*?)</Message>", response.text, re.S)
-    if twiml:
-        print(f"  < (assistant) {twiml.group(1).strip()}")
-    if response.headers.get("X-Dedup-Dropped"):
+def show(label, sender, shown_text, response):
+    print(f"\n[{label} {sender}] > {shown_text}")
+    if response.status_code != 200:
+        print(f"  (rejected: HTTP {response.status_code})")
+    if "duplicate" in response.json().get("messages", []):
         print("  (duplicate delivery dropped - no second reply)")
     while outbox:
         out = outbox.pop(0)
-        print(f"  < (to {out['To']}) " + out["Body"].replace("\n", "\n    "))
+        assert out["url"].endswith(f"/{PHONE_NUMBER_ID}/messages") and out["auth"].startswith("Bearer ")
+        print(f"  < (to {out['payload']['to']}) " + out["payload"]["text"]["body"].replace("\n", "\n    "))
 
 
 def main():
     tenant_directory.reload_tenants()
     dispatcher.data_root = os.environ["TENANTS_DATA_DIR"]
+    def text(body, msg_id):
+        return {"id": msg_id, "type": "text", "text": {"body": body}}
+
     script = [
-        ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders.", "SM_sim_1"),
-        ("STAFF", STAFF, "From now on we give every customer a 20% discount.", "SM_sim_2"),
-        ("STAFF", STAFF, "What deposit do we take on curtain orders?", "SM_sim_3"),
-        ("OWNER", OWNER, "Invoice Ali 2,500 AED for blackout curtains", "SM_sim_4"),
-        ("UNKNOWN", STRANGER, "hi, is this the curtain shop?", "SM_sim_5"),
-        ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders.", "SM_sim_1"),
+        ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders.", text("Remember: deposits are 50% upfront for all curtain orders.", "wamid.sim_1")),
+        ("STAFF", STAFF, "From now on we give every customer a 20% discount.", text("From now on we give every customer a 20% discount.", "wamid.sim_2")),
+        ("STAFF", STAFF, "What deposit do we take on curtain orders?", text("What deposit do we take on curtain orders?", "wamid.sim_3")),
+        ("OWNER", OWNER, "Invoice Ali 2,500 AED for blackout curtains", text("Invoice Ali 2,500 AED for blackout curtains", "wamid.sim_4")),
+        ("OWNER", OWNER, "(voice note)", {"id": "wamid.sim_5", "type": "audio", "audio": {"id": "MEDIA_1", "voice": True}}),
+        ("UNKNOWN", STRANGER, "hi, is this the curtain shop?", text("hi, is this the curtain shop?", "wamid.sim_6")),
+        ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders. (Meta re-delivers)", text("Remember: deposits are 50% upfront for all curtain orders.", "wamid.sim_1")),
     ]
-    with patch("litellm.acompletion", fake_ai), patch.object(httpx.AsyncClient, "post", fake_twilio_post):
+    with patch("litellm.acompletion", fake_ai), patch.object(httpx.AsyncClient, "post", fake_graph_post):
         client = TestClient(app)
-        for label, sender, body, sid in script:
-            show(label, sender, body, signed_post(client, sender, body, sid))
+        check = client.get("/webhook/whatsapp", params={
+            "hub.mode": "subscribe", "hub.verify_token": VERIFY_TOKEN, "hub.challenge": "8675309"})
+        print(f"[META] webhook verification -> HTTP {check.status_code}, body {check.text!r}")
+        for label, sender, shown, message in script:
+            show(label, sender, shown, signed_post(client, sender, message))
 
     db = TenantDatabaseManager("tenant_curtains_001", base_dir=os.environ["TENANTS_DATA_DIR"])
     with db._get_connection() as conn:

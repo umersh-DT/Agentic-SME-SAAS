@@ -22,7 +22,7 @@ def load_default_settings(config_path: str = "config/default_settings.yaml") -> 
         "quotas": {"enforce": False},
         "quotas_usd_monthly": {"starter": 5.00, "pro": 20.00, "enterprise": 100.00},
         "pricing_per_1m_tokens": {"prompt_usd": 0.150, "completion_usd": 0.600},
-        "whatsapp": {"max_message_chars": 1550, "history_limit": 10},
+        "whatsapp": {"max_message_chars": 4096, "history_limit": 10},
     }
 
 
@@ -170,7 +170,7 @@ class TenantDatabaseManager:
         body: str,
         num_media: int = 0,
     ) -> None:
-        """Persists message before acknowledging Twilio webhook."""
+        """Persists message before acknowledging the WhatsApp webhook."""
         await asyncio.to_thread(self._sync_persist_inbound_message, message_sid, from_number, body, num_media)
 
     def _sync_update_message_status(self, message_sid: str, status: str) -> None:

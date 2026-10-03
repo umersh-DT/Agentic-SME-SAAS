@@ -39,7 +39,8 @@ pricing_per_1m_tokens_by_model:
     completion_usd: 0.400
 
 whatsapp:
-  max_message_chars: 1550
+  # Meta WhatsApp text limit is 4096 characters; longer replies are split.
+  max_message_chars: 4096
   media_fallback_reply: "Voice notes and media messages are coming soon! Please text your request for now."
   error_fallback_reply: "I'm having trouble processing that request right now. Please try again in a moment."
   history_limit: 10

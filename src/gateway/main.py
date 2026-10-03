@@ -5,8 +5,8 @@ import time
 from fastapi import FastAPI, Request, Response
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-from src.gateway.twilio_webhook import (
-    router as twilio_router,
+from src.gateway.whatsapp_webhook import (
+    router as whatsapp_router,
     replay_all_pending_messages,
 )
 from src.gateway.stripe_billing import router as stripe_router
@@ -81,7 +81,7 @@ async def prometheus_metrics_middleware(request: Request, call_next):
 
 
 # Include Ingress Routers
-app.include_router(twilio_router)
+app.include_router(whatsapp_router)
 app.include_router(stripe_router)
 
 
