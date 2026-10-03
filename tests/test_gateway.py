@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import hmac
 import json
@@ -16,10 +15,11 @@ from src.core.storage_models import TenantDatabaseManager
 from src.gateway.dispatcher import TenantWorkerDispatcher
 from src.gateway.main import app
 from src.gateway.stripe_billing import provision_tenant_storage
-from src.gateway.twilio_webhook import (
+from src.gateway.whatsapp_webhook import (
     StrictTenantDirectory,
     dispatcher as global_dispatcher,
     tenant_directory,
+    to_e164,
 )
 from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.security import TenantConfig, normalize_phone_number
@@ -28,18 +28,49 @@ from src.utils.security import TenantConfig, normalize_phone_number
 class TestGatewayWebhook(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
-        self.auth_token = "test_auth_token_secret_123"
+        self.app_secret = "test_meta_app_secret_123"
+        self.verify_token = "test_verify_token_456"
+        self.phone_number_id = "109876543210"
         self.stripe_secret = "whsec_mock_test_secret_9988"
-        self.webhook_url = "http://testserver/webhook/whatsapp"
+        self.meta_env = {
+            "WHATSAPP_APP_SECRET": self.app_secret,
+            "WHATSAPP_VERIFY_TOKEN": self.verify_token,
+            "WHATSAPP_PHONE_NUMBER_ID": self.phone_number_id,
+        }
 
     def tearDown(self):
         tenant_directory.reload_tenants()
 
-    def _generate_twilio_signature(self, url: str, params: dict, token: str) -> str:
-        concatenated = url + "".join(f"{k}{v}" for k, v in sorted(params.items()))
-        return base64.b64encode(
-            hmac.new(token.encode("utf-8"), concatenated.encode("utf-8"), hashlib.sha1).digest()
-        ).decode("utf-8")
+    def _meta_payload(self, wa_from: str, message: dict, phone_number_id: str = None) -> bytes:
+        """Builds a WhatsApp Cloud API webhook body in Meta's documented shape."""
+        return json.dumps({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "WABA_ID",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15550001111",
+                            "phone_number_id": phone_number_id or self.phone_number_id,
+                        },
+                        "contacts": [{"profile": {"name": "Tester"}, "wa_id": wa_from}],
+                        "messages": [dict({"from": wa_from, "timestamp": "1730000000"}, **message)],
+                    },
+                }],
+            }],
+        }).encode("utf-8")
+
+    def _text(self, wa_from: str, body: str, msg_id: str, **kw) -> bytes:
+        return self._meta_payload(wa_from, {"id": msg_id, "type": "text", "text": {"body": body}}, **kw)
+
+    def _sign(self, body: bytes, secret: str = None) -> dict:
+        digest = hmac.new((secret or self.app_secret).encode("utf-8"), body, hashlib.sha256).hexdigest()
+        return {"X-Hub-Signature-256": f"sha256={digest}", "Content-Type": "application/json"}
+
+    def _post(self, body: bytes, headers: dict):
+        return self.client.post("/webhook/whatsapp", content=body, headers=headers)
 
     # =========================================================================
     # 1. CORE GATEWAY & DIRECTORY RESOLUTION TESTS
@@ -105,113 +136,183 @@ class TestGatewayWebhook(unittest.TestCase):
                 os.remove(temp_path)
 
     # =========================================================================
-    # 2. TWILIO INGRESS WEBHOOK SECURITY & ISOLATED CONTRACT TESTS
+    # 2. META WHATSAPP INGRESS WEBHOOK SECURITY & CONTRACT TESTS
     # =========================================================================
 
-    def test_twilio_fail_closed_without_token(self):
-        with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": ""}):
-            response = self.client.post(
-                "/webhook/whatsapp",
-                data={
-                    "From": "whatsapp:+971501112233",
-                    "To": "whatsapp:+14155238886",
-                    "Body": "Hello",
-                    "MessageSid": "SM_unauthed_test",
-                },
-            )
-            self.assertEqual(response.status_code, 403)
+    def test_meta_verification_echoes_raw_challenge(self):
+        with patch.dict("os.environ", self.meta_env):
+            ok = self.client.get("/webhook/whatsapp", params={
+                "hub.mode": "subscribe", "hub.verify_token": self.verify_token, "hub.challenge": "1158201444",
+            })
+            bad = self.client.get("/webhook/whatsapp", params={
+                "hub.mode": "subscribe", "hub.verify_token": "wrong", "hub.challenge": "1158201444",
+            })
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.text, "1158201444")
+        self.assertEqual(bad.status_code, 403)
 
-    def test_twilio_webhook_deduplication(self):
-        """Ensures that repeated messages with identical MessageSid are dropped."""
-        payload = {
-            "From": "+971501234567",
-            "To": "+14155238886",
-            "Body": "First attempt",
-            "MessageSid": "SM_dedup_unique_sid_test",
-        }
-        sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
+    def test_meta_verification_fails_closed_without_verify_token(self):
+        with patch.dict("os.environ", {"WHATSAPP_VERIFY_TOKEN": ""}):
+            resp = self.client.get("/webhook/whatsapp", params={
+                "hub.mode": "subscribe", "hub.verify_token": "", "hub.challenge": "1",
+            })
+        self.assertEqual(resp.status_code, 403)
 
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            "os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token, "TENANTS_DATA_DIR": temp_dir}
-        ), patch("src.gateway.twilio_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock):
-            resp1 = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
-            self.assertEqual(resp1.status_code, 200)
+    def test_meta_post_fails_closed_without_app_secret(self):
+        body = self._text("971501234567", "Hello", "wamid.unauthed")
+        with patch.dict("os.environ", {"WHATSAPP_APP_SECRET": ""}):
+            resp = self._post(body, self._sign(body))
+        self.assertEqual(resp.status_code, 403)
 
-            resp2 = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
-            self.assertEqual(resp2.status_code, 200)
-            self.assertEqual(resp2.headers.get("X-Dedup-Dropped"), "true")
-
-    def test_twilio_webhook_unregistered_sender_rejected(self):
-        """Verifies unknown sender receives rejection TwiML without invoking agent loop."""
-        payload = {
-            "From": "+971509990000",
-            "To": "+14155238886",
-            "Body": "Hello unlisted",
-            "MessageSid": "SM_unregistered_001",
-        }
-        sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
-
-        with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token}):
-            response = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("<Message>This phone number is not registered", response.text)
-
-    def test_twilio_signed_text_message_registered_sender(self):
-        """Isolated test: verifies webhook validates signature, persists, and enqueues dispatcher."""
-        payload = {
-            "From": "+971501234567",
-            "To": "+14155238886",
-            "Body": "Hello assistant",
-            "MessageSid": "SM_valid_registered_1",
-        }
-        sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
-
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            "os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token, "TENANTS_DATA_DIR": temp_dir}
-        ), patch(
-            "src.gateway.twilio_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+    def test_meta_post_rejects_bad_or_missing_signature(self):
+        body = self._text("971501234567", "Hello", "wamid.badsig")
+        with patch.dict("os.environ", self.meta_env), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
         ) as mock_dispatch:
-            response = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("<Response></Response>", response.text)
-            mock_dispatch.assert_called_once()
+            wrong_secret = self._post(body, self._sign(body, secret="not_the_secret"))
+            missing = self._post(body, {"Content-Type": "application/json"})
+            tampered = self._post(body.replace(b"Hello", b"Hacked"), self._sign(body))
+        self.assertEqual([wrong_secret.status_code, missing.status_code, tampered.status_code], [403, 403, 403])
+        mock_dispatch.assert_not_called()
 
-    def test_twilio_signed_voice_note_empty_body(self):
-        """Isolated test: non-text/media-only messages trigger advisory notice without calling agent."""
-        payload = {
-            "From": "+971501234567",
-            "To": "+14155238886",
-            "Body": "",
-            "NumMedia": "1",
-            "MessageSid": "SM_voice_note_empty_body_1",
-        }
-        sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
+    def test_sender_number_is_normalized_to_e164(self):
+        self.assertEqual(to_e164("971501234567"), "+971501234567")
+        self.assertEqual(to_e164("+971501234567"), "+971501234567")
 
+    def test_meta_status_updates_are_ignored(self):
+        body = json.dumps({
+            "object": "whatsapp_business_account",
+            "entry": [{"changes": [{"field": "messages", "value": {
+                "metadata": {"phone_number_id": self.phone_number_id},
+                "statuses": [{"id": "wamid.out1", "status": "delivered", "recipient_id": "971501234567"}],
+            }}]}],
+        }).encode()
+        with patch.dict("os.environ", self.meta_env), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch, patch(
+            "src.gateway.whatsapp_webhook.reply_skill.send_reply", new_callable=AsyncMock
+        ) as mock_reply:
+            resp = self._post(body, self._sign(body))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["messages"], [])
+        mock_dispatch.assert_not_called()
+        mock_reply.assert_not_called()
+
+    def test_meta_payload_for_other_phone_number_id_is_ignored(self):
+        body = self._text("971501234567", "Hello", "wamid.other_number", phone_number_id="999")
+        with patch.dict("os.environ", self.meta_env), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch:
+            resp = self._post(body, self._sign(body))
+        self.assertEqual(resp.json()["messages"], [])
+        mock_dispatch.assert_not_called()
+
+    def test_meta_webhook_deduplication(self):
+        """A message id delivered twice is processed once."""
+        body = self._text("971501234567", "First attempt", "wamid.dedup_unique")
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            "os.environ", {"TWILIO_AUTH_TOKEN": self.auth_token, "TENANTS_DATA_DIR": temp_dir}
+            "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
         ), patch(
-            "src.gateway.twilio_webhook.reply_skill.send_reply", new_callable=AsyncMock
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch:
+            resp1 = self._post(body, self._sign(body))
+            resp2 = self._post(body, self._sign(body))
+        self.assertEqual(resp1.json()["messages"], ["dispatched"])
+        self.assertEqual(resp2.json()["messages"], ["duplicate"])
+        mock_dispatch.assert_called_once()
+
+    def test_meta_unregistered_sender_gets_one_notice_per_day(self):
+        """Unknown sender gets the 'not registered' notice as a normal outbound message, at most once per 24h."""
+        with patch.dict("os.environ", self.meta_env), patch(
+            "src.gateway.whatsapp_webhook.reply_skill.send_reply", new_callable=AsyncMock
         ) as mock_reply, patch(
-            "src.gateway.twilio_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch, patch(
+            "src.gateway.whatsapp_webhook.rejection_limiter._last_reply", {}
+        ):
+            first = self._text("971509990000", "Hello unlisted", "wamid.unreg_1")
+            second = self._text("971509990000", "Hello again", "wamid.unreg_2")
+            r1 = self._post(first, self._sign(first))
+            r2 = self._post(second, self._sign(second))
+        self.assertEqual(r1.json()["messages"], ["unregistered_notified"])
+        self.assertEqual(r2.json()["messages"], ["unregistered_silent"])
+        mock_reply.assert_called_once()
+        self.assertEqual(mock_reply.call_args.kwargs["to_number"], "+971509990000")
+        self.assertIn("not registered", mock_reply.call_args.kwargs["message"])
+        mock_dispatch.assert_not_called()
+
+    def test_meta_signed_text_message_registered_sender(self):
+        """Valid signed text from a registered sender is persisted and dispatched with the E.164 number."""
+        body = self._text("971501234567", "Hello assistant", "wamid.valid_registered_1")
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
+        ), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
         ) as mock_dispatch:
-            response = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
+            response = self._post(body, self._sign(body))
             self.assertEqual(response.status_code, 200)
-            mock_reply.assert_called_once()
-            mock_dispatch.assert_not_called()
+            mock_dispatch.assert_called_once()
+            kwargs = mock_dispatch.call_args.kwargs
+            self.assertEqual(kwargs["from_number"], "+971501234567")
+            self.assertEqual(kwargs["message_sid"], "wamid.valid_registered_1")
+            self.assertEqual(kwargs["body"], "Hello assistant")
+
+            db_mgr = TenantDatabaseManager(tenant_id="tenant_curtains_001", base_dir=temp_dir)
+            with db_mgr._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT from_number, body, status FROM inbound_messages WHERE message_sid = ?;",
+                    ("wamid.valid_registered_1",),
+                ).fetchone()
+            self.assertEqual((row["from_number"], row["body"], row["status"]), ("+971501234567", "Hello assistant", "pending"))
+
+    def test_meta_voice_note_is_sent_for_transcription(self):
+        """Voice notes are persisted with their media id and handed to the voice handler, not the text agent."""
+        body = self._meta_payload("971501234567", {
+            "id": "wamid.voice_1", "type": "audio",
+            "audio": {"id": "MEDIA_ID_1", "mime_type": "audio/ogg; codecs=opus", "voice": True},
+        })
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
+        ), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_voice_message", new_callable=AsyncMock
+        ) as mock_voice, patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch:
+            response = self._post(body, self._sign(body))
+            db_mgr = TenantDatabaseManager(tenant_id="tenant_curtains_001", base_dir=temp_dir)
+            with db_mgr._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT media_id, num_media FROM inbound_messages WHERE message_sid = 'wamid.voice_1';"
+                ).fetchone()
+        self.assertEqual(response.json()["messages"], ["voice_dispatched"])
+        mock_dispatch.assert_not_called()
+        mock_voice.assert_called_once()
+        self.assertEqual(mock_voice.call_args.kwargs["media_id"], "MEDIA_ID_1")
+        self.assertEqual(mock_voice.call_args.kwargs["from_number"], "+971501234567")
+        self.assertEqual((row["media_id"], row["num_media"]), ("MEDIA_ID_1", 1))
+
+    def test_meta_image_gets_not_supported_reply(self):
+        body = self._meta_payload("971501234567", {"id": "wamid.img_1", "type": "image", "image": {"id": "IMG_1"}})
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
+        ), patch(
+            "src.gateway.whatsapp_webhook.reply_skill.send_reply", new_callable=AsyncMock
+        ) as mock_reply, patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch:
+            response = self._post(body, self._sign(body))
+        self.assertEqual(response.json()["messages"], ["media_advisory"])
+        self.assertIn("aren't supported yet", mock_reply.call_args.kwargs["message"])
+        mock_dispatch.assert_not_called()
 
     # =========================================================================
     # 3. END-TO-END WEBHOOK INTEGRATION TEST
     # =========================================================================
 
     def test_e2e_webhook_background_task_to_llm_and_reply(self):
-        """Webhook -> Background task -> Mocked LLM -> Outbound reply -> token_usage in SQLite."""
-        payload = {
-            "From": "+971501234567",
-            "To": "+14155238886",
-            "Body": "What is our company deposit policy?",
-            "MessageSid": "SM_e2e_full_chain_test_01",
-        }
-        sig = self._generate_twilio_signature(self.webhook_url, payload, self.auth_token)
+        """Signed Meta webhook -> Background task -> Mocked LLM -> Outbound reply -> token_usage in SQLite."""
+        message_id = "wamid.e2e_full_chain_test_01"
+        body = self._text("971501234567", "What is our company deposit policy?", message_id)
 
         mock_resp = MagicMock()
         mock_resp.choices = [MagicMock()]
@@ -230,20 +331,16 @@ class TestGatewayWebhook(unittest.TestCase):
 
             with patch.dict(
                 "os.environ",
-                {
-                    "TWILIO_AUTH_TOKEN": self.auth_token,
-                    "TENANTS_CONFIG_PATH": temp_yaml,
-                    "TENANTS_DATA_DIR": temp_dir,
-                },
+                dict(self.meta_env, TENANTS_CONFIG_PATH=temp_yaml, TENANTS_DATA_DIR=temp_dir),
             ), patch.object(global_dispatcher, "data_root", temp_dir), patch.object(
                 global_dispatcher.reply_skill, "send_reply", new_callable=AsyncMock
             ) as mock_send_reply, patch(
                 "litellm.acompletion", return_value=mock_resp
             ):
                 tenant_directory.reload_tenants()
-                mock_send_reply.return_value = {"success": True, "message_sid": "SM_mock_e2e_reply"}
+                mock_send_reply.return_value = {"success": True, "message_sid": "wamid.reply"}
 
-                response = self.client.post("/webhook/whatsapp", data=payload, headers={"X-Twilio-Signature": sig})
+                response = self._post(body, self._sign(body))
                 self.assertEqual(response.status_code, 200)
 
                 mock_send_reply.assert_called_once()
@@ -253,17 +350,13 @@ class TestGatewayWebhook(unittest.TestCase):
                 db_mgr = TenantDatabaseManager(tenant_id="tenant_curtains_001", base_dir=temp_dir)
                 with db_mgr._get_connection() as conn:
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT status FROM inbound_messages WHERE message_sid = ?;",
-                        (payload["MessageSid"],),
-                    )
+                    cursor.execute("SELECT status FROM inbound_messages WHERE message_sid = ?;", (message_id,))
                     row = cursor.fetchone()
                     self.assertIsNotNone(row)
                     self.assertEqual(row["status"], "completed")
 
                     cursor.execute(
-                        "SELECT total_tokens, cost_usd FROM token_usage WHERE message_sid = ?;",
-                        (payload["MessageSid"],),
+                        "SELECT total_tokens, cost_usd FROM token_usage WHERE message_sid = ?;", (message_id,)
                     )
                     token_row = cursor.fetchone()
                     self.assertIsNotNone(token_row)

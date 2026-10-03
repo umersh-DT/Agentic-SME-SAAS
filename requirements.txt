@@ -1,8 +1,6 @@
-# OpenHuman Agent Core & Async Framework
-openhuman>=0.2.1
+# Core Framework
 pydantic>=2.7.0
 pydantic-settings>=2.2.1
-asyncio>=3.4.3
 aiohttp>=3.9.5
 
 # Webhook Gateway & API Routing
@@ -24,15 +22,11 @@ selenium>=4.21.0
 
 # Observability & Configuration
 pyyaml>=6.0.1
+tzdata>=2024.1
 python-dotenv>=1.0.1
 structlog>=24.2.0
 
-
-
-
-stripe>=8.0.0
-aiosqlite>=0.20.0
+# Gateway Extras, Metrics & LLM
 python-multipart>=0.0.9
 prometheus_client>=0.20.0
 litellm>=1.40.0
-twilio>=9.0.0

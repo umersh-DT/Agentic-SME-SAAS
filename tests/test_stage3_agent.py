@@ -4,10 +4,39 @@ import os
 import tempfile
 import unittest
 
+from decimal import Decimal
+
 from src.core.agent_loop import LiteLLMAgent
-from src.core.storage_models import TenantDatabaseManager
+from src.core.storage_models import TenantDatabaseManager, load_default_settings
+from src.skills.invoicing import LineItem
 from src.skills.tools_registry import get_scoped_tools
 from src.skills.whatsapp_reply import WhatsAppReplySkill, split_message_text
+
+
+class FakeSMTP:
+    """Stands in for smtplib.SMTP and records the emails that would have been sent."""
+
+    sent = []
+    logins = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port = host, port
+        FakeSMTP.logins = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self):
+        pass
+
+    def login(self, user, password):
+        FakeSMTP.logins.append((user, password))
+
+    def send_message(self, msg):
+        FakeSMTP.sent.append(msg)
 
 
 class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
@@ -20,19 +49,19 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
 
-    def test_message_splitting_1550_chars(self):
+    def test_message_splitting_respects_limit(self):
         short_text = "Hello from WhatsApp!"
-        self.assertEqual(split_message_text(short_text, max_chars=1550), [short_text])
+        self.assertEqual(split_message_text(short_text, max_chars=4096), [short_text])
 
-        para1 = "Paragraph 1: " + ("A" * 1200)
-        para2 = "Paragraph 2: " + ("B" * 1200)
-        para3 = "Paragraph 3: " + ("C" * 1200)
+        para1 = "Paragraph 1: " + ("A" * 3000)
+        para2 = "Paragraph 2: " + ("B" * 3000)
+        para3 = "Paragraph 3: " + ("C" * 3000)
         combined = f"{para1}\n\n{para2}\n\n{para3}"
 
-        chunks = split_message_text(combined, max_chars=1550)
+        chunks = split_message_text(combined, max_chars=4096)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
-            self.assertLessEqual(len(c), 1550)
+            self.assertLessEqual(len(c), 4096)
 
     def test_tools_tenant_id_not_exposed_in_schema(self):
         """Verifies tenant_id is NEVER in tool schema but present in bound callables."""
@@ -84,14 +113,26 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[0]["invoice_number"].endswith("1001"))
         self.assertTrue(rows[1]["invoice_number"].endswith("1002"))
 
+    def _seed_spend(self, cost_usd: float) -> None:
+        with self.db_manager._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO token_usage (message_sid, model, prompt_tokens, completion_tokens, total_tokens, cost_usd)
+                VALUES ('SM_seed_spend', 'openai/gpt-4o-mini', 10000, 5000, 15000, ?);
+                """,
+                (cost_usd,),
+            )
+            conn.commit()
+
     async def test_quota_alert_sent_exactly_once_per_month(self):
-        """Fix 1: Two over-quota turns in the same month trigger exactly one platform alert[cite: 9]."""
+        """With quotas.enforce on: over-quota turns are blocked and trigger exactly one platform alert a month."""
         agent = LiteLLMAgent(
             tenant_id=self.tenant_id,
             plan_tier="starter",  # $5.00 monthly cap
             business_name="Luxe Curtain Interiors",
             base_data_dir=self.base_data_dir,
         )
+        agent.settings["quotas"] = {"enforce": True}
 
         # Pre-seed token_usage table with spend exceeding the $5.00 starter cap ($5.20 spent)
         with self.db_manager._get_connection() as conn:
@@ -108,7 +149,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
             return_value={"success": True, "message_sid": "SM_alert_test"}
         )
 
-        with patch.dict("os.environ", {"PLATFORM_ALERT_WHATSAPP": "+971509990000"}):
+        with patch.dict("os.environ", {"PLATFORM_ALERT_WHATSAPP": "+971509990000", "ALERT_EMAIL": ""}):
             # Turn 1: Quota exceeded -> should send user cap notice AND platform alert
             res1 = await agent.process_user_turn(
                 message_sid="SM_over_quota_turn_1",
@@ -143,6 +184,90 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
                 cursor.execute("SELECT alert_type, period FROM platform_alerts WHERE alert_type = 'quota';")
                 rows = cursor.fetchall()
                 self.assertEqual(len(rows), 1)
+
+    async def test_pilot_mode_never_blocks_but_records_cost_and_emails_once(self):
+        """Default (free pilot): over the plan amount the reply is normal, usage is recorded,
+        and the operator gets exactly one alert email for the month."""
+        self.assertFalse(load_default_settings()["quotas"]["enforce"])
+        agent = LiteLLMAgent(
+            tenant_id=self.tenant_id,
+            plan_tier="starter",
+            business_name="Luxe Curtain Interiors",
+            base_data_dir=self.base_data_dir,
+        )
+        self._seed_spend(5.20)
+
+        mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
+        mock_reply_skill.send_reply = AsyncMock(return_value={"success": True, "message_sid": "SM_ok"})
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.tool_calls = None
+        mock_resp.choices[0].message.content = "Our showroom opens at 9 AM."
+        mock_resp.choices[0].message.to_dict.return_value = {"role": "assistant", "content": "Our showroom opens at 9 AM."}
+        mock_resp.usage.prompt_tokens = 100
+        mock_resp.usage.completion_tokens = 20
+
+        FakeSMTP.sent = []
+        email_env = {
+            "ALERT_EMAIL": "operator@example.com",
+            "SMTP_USER": "sender@example.com",
+            "SMTP_PASSWORD": "app-password",
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_PORT": "587",
+            "PLATFORM_ALERT_WHATSAPP": "",
+        }
+        with patch.dict("os.environ", email_env), patch("smtplib.SMTP", FakeSMTP), \
+             patch("litellm.acompletion", return_value=mock_resp):
+            res1 = await agent.process_user_turn(
+                message_sid="SM_pilot_1", from_number="+971501234567",
+                user_message="When do you open?", reply_skill=mock_reply_skill,
+            )
+            res2 = await agent.process_user_turn(
+                message_sid="SM_pilot_2", from_number="+971501234567",
+                user_message="And on Friday?", reply_skill=mock_reply_skill,
+            )
+
+        for res in (res1, res2):
+            self.assertEqual(res["status"], "completed")
+            self.assertEqual(res["reply"], "Our showroom opens at 9 AM.")
+        sent_texts = [c.kwargs["message"] for c in mock_reply_skill.send_reply.call_args_list]
+        self.assertFalse(any("quota" in t.lower() for t in sent_texts))
+
+        with self.db_manager._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT message_sid, total_tokens FROM token_usage WHERE message_sid LIKE 'SM_pilot_%' ORDER BY id;"
+            ).fetchall()
+        self.assertEqual([(r["message_sid"], r["total_tokens"]) for r in rows], [("SM_pilot_1", 120), ("SM_pilot_2", 120)])
+        self.assertGreater(await self.db_manager.get_current_month_cost(), 5.20)
+
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        email = FakeSMTP.sent[0]
+        self.assertEqual(email["To"], "operator@example.com")
+        self.assertIn("Luxe Curtain Interiors", email["Subject"])
+        self.assertIn("Nothing is blocked", email.get_content())
+        self.assertEqual(FakeSMTP.logins, [("sender@example.com", "app-password")])
+
+    async def test_invoice_amount_includes_vat(self):
+        """'Invoice Ali 2,500 AED': 2,500 is the total; net 2,380.95 + VAT 119.05."""
+        _, callables = get_scoped_tools(tenant_id=self.tenant_id, base_data_dir=self.base_data_dir)
+        reply = await callables["create_invoice"](customer_name="Ali", amount=2500)
+
+        self.assertIn("Total (incl. 5% VAT): AED 2,500.00", reply)
+        self.assertIn("Net amount: AED 2,380.95", reply)
+        self.assertIn("VAT (5%): AED 119.05", reply)
+
+        with self.db_manager._get_connection() as conn:
+            row = conn.execute("SELECT subtotal, tax_amount, grand_total FROM invoices;").fetchone()
+        self.assertEqual((row["subtotal"], row["tax_amount"], row["grand_total"]), (2380.95, 119.05, 2500.0))
+
+    def test_vat_split_always_adds_up_to_amount_typed(self):
+        """For every amount from 0.01 to 300.00 and some large ones, net + VAT equals the amount exactly."""
+        amounts = [Decimal(c) / 100 for c in range(1, 30001)] + [Decimal("2500"), Decimal("99999.99"), Decimal("1234567.89")]
+        for amount in amounts:
+            item = LineItem(description="x", unit_price=amount, tax_rate=Decimal("0.05"), price_includes_tax=True)
+            self.assertEqual(item.subtotal + item.tax_amount, amount, f"mismatch for {amount}")
+            self.assertEqual(item.total, amount)
 
     async def test_agent_turn_with_invoice_tool_and_token_metering(self):
         """Simulates full LLM tool turn with real WhatsAppReplySkill return shape."""
@@ -220,7 +345,7 @@ class TestStage3AgentLoop(unittest.IsolatedAsyncioTestCase):
 
         mock_reply_skill = MagicMock(spec=WhatsAppReplySkill)
         mock_reply_skill.send_reply = AsyncMock(
-            return_value={"success": False, "error": "Twilio fatal 400"}
+            return_value={"success": False, "error": "WhatsApp API fatal error 400"}
         )
 
         mock_resp = MagicMock()

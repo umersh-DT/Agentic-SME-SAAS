@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
 TENANT_ID_REGEX = re.compile(r"^tenant_[a-z0-9_]+$")
@@ -18,6 +18,24 @@ def normalize_phone_number(phone: Optional[str]) -> str:
     if cleaned.startswith("whatsapp:"):
         cleaned = cleaned.replace("whatsapp:", "")
     return cleaned.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
+
+
+def mask_phone_number(phone: Optional[str]) -> str:
+    """Masks a phone number for privacy-safe logging (e.g. +97150***67)."""
+    cleaned = normalize_phone_number(phone)
+    if len(cleaned) >= 8:
+        return f"{cleaned[:5]}***{cleaned[-2:]}"
+    return "***"
+
+
+def describe_error_safely(error: Exception) -> str:
+    """Describes an exception for logs/responses without echoing raw input values (e.g. phone numbers)."""
+    if isinstance(error, ValidationError):
+        return "; ".join(
+            f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
+            for err in error.errors(include_url=False, include_input=False)
+        )
+    return str(error)
 
 
 class TenantConfig(BaseModel):
@@ -36,6 +54,30 @@ class TenantConfig(BaseModel):
     )
     website_url: Optional[str] = None
     target_keywords: List[str] = Field(default_factory=list)
+    # Google Calendar to book into (usually the owner's Gmail address), shared with the service account
+    google_calendar_id: Optional[str] = None
+    timezone: str = "Asia/Dubai"
+    business_hours: str = "09:00-18:00"
+    appointment_minutes: int = Field(default=60, ge=5, le=480)
+    # Search Console property, e.g. "sc-domain:example.com" or "https://example.com/"
+    search_console_property: Optional[str] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ValueError(f"Unknown timezone '{v}' (use names like Asia/Dubai).") from e
+        return v
+
+    @field_validator("business_hours")
+    @classmethod
+    def validate_business_hours(cls, v: str) -> str:
+        if not re.match(r"^\s*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*$", v or ""):
+            raise ValueError(f"business_hours must look like 09:00-18:00, got '{v}'.")
+        return v.replace(" ", "")
 
     @field_validator("tenant_id")
     @classmethod
@@ -53,7 +95,7 @@ class TenantConfig(BaseModel):
             return None
         norm = normalize_phone_number(v)
         if not E164_REGEX.match(norm):
-            raise ValueError(f"Invalid E.164 phone number format: '{v}' (normalized: '{norm}'). Must include leading '+' and country code.")
+            raise ValueError(f"Invalid E.164 phone number format: '{mask_phone_number(norm)}'. Must include leading '+' and country code.")
         return norm
 
     @field_validator("staff_phones", mode="before")
@@ -65,7 +107,7 @@ class TenantConfig(BaseModel):
         for p in v:
             norm = normalize_phone_number(p)
             if not E164_REGEX.match(norm):
-                raise ValueError(f"Invalid E.164 phone number in staff_phones: '{p}'. Must include leading '+' and country code.")
+                raise ValueError(f"Invalid E.164 phone number in staff_phones: '{mask_phone_number(norm)}'. Must include leading '+' and country code.")
             cleaned_list.append(norm)
         return list(dict.fromkeys(cleaned_list))
 
