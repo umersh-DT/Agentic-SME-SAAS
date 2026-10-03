@@ -142,6 +142,16 @@ python -m unittest discover -s tests -t .
 business, nobody is blocked, and `ALERT_EMAIL` gets one email per business per month when its
 spend passes the plan amount in `quotas_usd_monthly`. Set `enforce: true` and restart to block again.
 
+### What people can send on WhatsApp
+* Questions about the business → answered from the owner's saved rules.
+* `Invoice Ali 500 AED for deep cleaning` → draft invoice (the amount includes 5% VAT); the owner receives
+  it as a PDF marked DRAFT.
+* Voice notes → transcribed; the reply starts with `You said: "…"`, then it is handled like typed text.
+  Transcription cost is recorded per business like AI usage.
+* `help` → list of what the assistant can do.
+* Owner only: `Remember: …` (teach a rule), `list rules`, `change rule 2: new text`, `forget rule 2`,
+  `approve invoice 1001` (sends the final PDF without DRAFT). These commands do not use the AI.
+
 ---
 
 ## 5. Backups

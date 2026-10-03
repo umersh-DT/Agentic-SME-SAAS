@@ -109,7 +109,11 @@ class ContextExtractor:
         """Turns a teaching message into a normalized memory update."""
         if not self.looks_like_rule(text):
             return ExtractedMemoryUpdate(is_rule_or_preference=False)
+        return self.normalize_rule(text)
 
+    @staticmethod
+    def normalize_rule(text: str) -> ExtractedMemoryUpdate:
+        """Normalizes rule text (used for new rules and for 'change rule N: ...')."""
         content = _LEADING_FILLER_RE.sub("", text.strip(), count=1).strip() or text.strip()
         content = content[0].upper() + content[1:]
 

@@ -265,12 +265,34 @@ class TestGatewayWebhook(unittest.TestCase):
                 ).fetchone()
             self.assertEqual((row["from_number"], row["body"], row["status"]), ("+971501234567", "Hello assistant", "pending"))
 
-    def test_meta_voice_note_gets_advisory_without_agent(self):
-        """Media-only messages (voice note) trigger the advisory reply without calling the agent."""
+    def test_meta_voice_note_is_sent_for_transcription(self):
+        """Voice notes are persisted with their media id and handed to the voice handler, not the text agent."""
         body = self._meta_payload("971501234567", {
             "id": "wamid.voice_1", "type": "audio",
             "audio": {"id": "MEDIA_ID_1", "mime_type": "audio/ogg; codecs=opus", "voice": True},
         })
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
+        ), patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_voice_message", new_callable=AsyncMock
+        ) as mock_voice, patch(
+            "src.gateway.whatsapp_webhook.dispatcher.process_incoming_message", new_callable=AsyncMock
+        ) as mock_dispatch:
+            response = self._post(body, self._sign(body))
+            db_mgr = TenantDatabaseManager(tenant_id="tenant_curtains_001", base_dir=temp_dir)
+            with db_mgr._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT media_id, num_media FROM inbound_messages WHERE message_sid = 'wamid.voice_1';"
+                ).fetchone()
+        self.assertEqual(response.json()["messages"], ["voice_dispatched"])
+        mock_dispatch.assert_not_called()
+        mock_voice.assert_called_once()
+        self.assertEqual(mock_voice.call_args.kwargs["media_id"], "MEDIA_ID_1")
+        self.assertEqual(mock_voice.call_args.kwargs["from_number"], "+971501234567")
+        self.assertEqual((row["media_id"], row["num_media"]), ("MEDIA_ID_1", 1))
+
+    def test_meta_image_gets_not_supported_reply(self):
+        body = self._meta_payload("971501234567", {"id": "wamid.img_1", "type": "image", "image": {"id": "IMG_1"}})
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             "os.environ", dict(self.meta_env, TENANTS_DATA_DIR=temp_dir)
         ), patch(
@@ -280,7 +302,7 @@ class TestGatewayWebhook(unittest.TestCase):
         ) as mock_dispatch:
             response = self._post(body, self._sign(body))
         self.assertEqual(response.json()["messages"], ["media_advisory"])
-        mock_reply.assert_called_once()
+        self.assertIn("aren't supported yet", mock_reply.call_args.kwargs["message"])
         mock_dispatch.assert_not_called()
 
     # =========================================================================

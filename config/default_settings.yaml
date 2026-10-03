@@ -41,6 +41,16 @@ pricing_per_1m_tokens_by_model:
 whatsapp:
   # Meta WhatsApp text limit is 4096 characters; longer replies are split.
   max_message_chars: 4096
-  media_fallback_reply: "Voice notes and media messages are coming soon! Please text your request for now."
+  media_fallback_reply: "I can read text messages and voice notes. Photos, videos and files aren't supported yet."
   error_fallback_reply: "I'm having trouble processing that request right now. Please try again in a moment."
   history_limit: 10
+
+voice:
+  # Voice notes longer than this are not transcribed (WhatsApp voice notes are small; 10 MB is several minutes).
+  max_bytes: 10485760
+  # Gemini bills audio input at a higher rate than text; check Google's pricing page when changing models.
+  gemini_rates_per_1m_tokens:
+    audio_input_usd: 1.00
+    output_usd: 2.50
+  openai_transcription_model: "whisper-1"
+  openai_usd_per_minute: 0.006

@@ -135,7 +135,8 @@ NOT_REGISTERED_NOTICE = (
     "Please contact your business administrator."
 )
 
-# Message types that carry media; voice notes are handled in a later step.
+# Voice notes are transcribed; other media types get a "not supported yet" reply.
+VOICE_MESSAGE_TYPES = {"audio", "voice"}
 MEDIA_MESSAGE_TYPES = {"audio", "voice", "image", "video", "document", "sticker"}
 
 
@@ -238,6 +239,8 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
         logger.info(f"[WEBHOOK] Ignoring unsupported message type '{msg_type}' for tenant={tenant_id}.")
         return "ignored_type"
 
+    media_id = str((message.get(msg_type) or {}).get("id", "")) if is_media else ""
+
     # 3. Crash replay safety: persist before acknowledging Meta
     base_data_dir = os.environ.get("TENANTS_DATA_DIR", "/app/data/tenants")
     db_manager = TenantDatabaseManager(tenant_id=tenant_id, base_dir=base_data_dir)
@@ -246,9 +249,24 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
         from_number=from_number,
         body=body_text,
         num_media=1 if is_media else 0,
+        media_id=media_id or None,
     )
 
-    # 4. Media messages: advisory reply for now
+    # 4. Voice notes: download + transcribe after acknowledging, then handled like text
+    if msg_type in VOICE_MESSAGE_TYPES and media_id:
+        background_tasks.add_task(
+            dispatcher.process_voice_message,
+            tenant_id=tenant_id,
+            from_number=from_number,
+            media_id=media_id,
+            message_sid=message_id,
+            plan_tier=tenant_config.plan_tier,
+            business_name=tenant_config.business_name,
+            owner_phone=tenant_config.owner_phone,
+        )
+        return "voice_dispatched"
+
+    # 5. Other media: not supported yet
     if is_media:
         settings = load_default_settings()
         media_msg = settings.get("whatsapp", {}).get(
@@ -259,7 +277,7 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
         background_tasks.add_task(reply_skill.send_reply, to_number=from_number, message=media_msg)
         return "media_advisory"
 
-    # 5. Hand off to the agent loop after acknowledging (dispatcher drops stale retries)
+    # 6. Hand off to the agent loop after acknowledging (dispatcher drops stale retries)
     background_tasks.add_task(
         dispatcher.process_incoming_message,
         tenant_id=tenant_id,

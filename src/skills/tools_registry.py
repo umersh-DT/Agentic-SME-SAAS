@@ -18,6 +18,7 @@ async def _execute_create_invoice(
     description: str = "Standard services",
     deposit_percentage: float = 0.0,
     client_contact: Optional[str] = None,
+    created_invoices: Optional[List[str]] = None,
 ) -> str:
     """Generates and saves a draft invoice. `amount` is the TOTAL the customer pays, VAT included."""
     logger.info(f"[TOOL INVOICE] Tenant={tenant_id} | Total={amount} AED (VAT inclusive)")
@@ -69,8 +70,11 @@ async def _execute_create_invoice(
             "balance_due": float(draft.balance_due),
             "status": "draft",
             "notes": draft.notes,
+            "description": description,
         }
         await db_mgr.save_invoice_draft(draft_record)
+        if created_invoices is not None:
+            created_invoices.append(draft.invoice_number)
 
         # 5. Return honest, explicit status that this is a draft not yet sent
         reply_lines = [
@@ -86,7 +90,7 @@ async def _execute_create_invoice(
             )
             reply_lines.append(f"Balance Due: {draft.currency} {draft.balance_due:,.2f}")
 
-        reply_lines.append("Status: Draft invoice — not sent to client.")
+        reply_lines.append("Status: Draft invoice — not sent to client. A PDF goes to the owner for approval.")
         return "\n".join(reply_lines)
 
     except Exception as e:
@@ -117,6 +121,7 @@ async def _execute_search_memory(
 def get_scoped_tools(
     tenant_id: str,
     base_data_dir: str = "/app/data/tenants",
+    created_invoices: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Callable]]:
     """Returns OpenAI/LiteLLM tool definitions and executable callables with tenant_id bound.
 
@@ -181,7 +186,9 @@ def get_scoped_tools(
 
     # Map function names to server-bound callables
     callables_map = {
-        "create_invoice": partial(_execute_create_invoice, tenant_id, base_data_dir),
+        "create_invoice": partial(
+            _execute_create_invoice, tenant_id, base_data_dir, created_invoices=created_invoices
+        ),
         "search_business_memory": partial(_execute_search_memory, tenant_id, base_data_dir),
     }
 

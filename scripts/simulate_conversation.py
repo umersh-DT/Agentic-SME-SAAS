@@ -2,9 +2,10 @@
 
 Runs the real FastAPI app with Meta WhatsApp Cloud API webhooks (verification, X-Hub-Signature-256
 checks, routing, dispatcher, business memory, invoicing tools and SQLite storage).
-Only two things are stubbed:
+Only external services are stubbed:
   * the AI model (litellm.acompletion) - a tiny scripted stand-in, no API key needed
-  * the outbound Graph API HTTP call - captured and printed instead of sent
+  * Gemini voice transcription HTTP - returns a fixed transcript
+  * Meta Graph API HTTP (send text, upload PDF, send document, download voice note) - captured and printed
 
 Usage:  python scripts/simulate_conversation.py
 """
@@ -39,6 +40,7 @@ os.environ.update(
         "WHATSAPP_VERIFY_TOKEN": VERIFY_TOKEN,
         "WHATSAPP_TOKEN": "simulated_access_token",
         "WHATSAPP_PHONE_NUMBER_ID": PHONE_NUMBER_ID,
+        "GEMINI_API_KEY": "simulated_gemini_key",
         "TENANTS_DATA_DIR": os.path.join(WORK_DIR, "tenants"),
         "TENANTS_CONFIG_PATH": os.path.join(WORK_DIR, "tenants.yaml"),
         "ALERT_EMAIL": "",
@@ -111,11 +113,32 @@ async def fake_ai(model, messages, **kwargs):
     return SimpleNamespace(choices=[SimpleNamespace(message=reply)], usage=usage)
 
 
-# ---------------- Stub 2: outbound WhatsApp (Graph API) HTTP ----------------
-async def fake_graph_post(self, url, json=None, headers=None, **kwargs):
-    outbox.append({"url": url, "payload": json, "auth": (headers or {}).get("Authorization", "")})
-    return httpx.Response(200, json={"messages": [{"id": f"wamid.out_{len(outbox)}"}]},
-                          request=httpx.Request("POST", url))
+# ---------------- Stub 2: external HTTP (Meta Graph API, Gemini transcription) ----------------
+VOICE_TRANSCRIPT = "How much deposit do we take on curtain orders?"
+uploads = {}
+
+
+async def fake_http_post(self, url, json=None, headers=None, files=None, **kwargs):
+    request = httpx.Request("POST", url)
+    if "generativelanguage.googleapis.com" in url:
+        return httpx.Response(200, request=request, json={
+            "candidates": [{"content": {"parts": [{"text": VOICE_TRANSCRIPT}]}}],
+            "usageMetadata": {"promptTokenCount": 900, "candidatesTokenCount": 15},
+        })
+    assert url.startswith(f"https://graph.facebook.com/") and (headers or {}).get("Authorization", "").startswith("Bearer ")
+    if url.endswith("/media"):
+        media_id = f"UPLOADED_{len(uploads) + 1}"
+        uploads[media_id] = files["file"]
+        return httpx.Response(200, request=request, json={"id": media_id})
+    outbox.append(json)
+    return httpx.Response(200, request=request, json={"messages": [{"id": f"wamid.out_{len(outbox)}"}]})
+
+
+async def fake_http_get(self, url, headers=None, **kwargs):
+    request = httpx.Request("GET", url)
+    if url.endswith("/MEDIA_1"):
+        return httpx.Response(200, request=request, json={"url": "https://lookaside.fbsbx.com/voice", "mime_type": "audio/ogg; codecs=opus"})
+    return httpx.Response(200, request=request, content=b"OggS-simulated-voice-note")
 
 
 def signed_post(client, sender, message):
@@ -141,8 +164,13 @@ def show(label, sender, shown_text, response):
         print("  (duplicate delivery dropped - no second reply)")
     while outbox:
         out = outbox.pop(0)
-        assert out["url"].endswith(f"/{PHONE_NUMBER_ID}/messages") and out["auth"].startswith("Bearer ")
-        print(f"  < (to {out['payload']['to']}) " + out["payload"]["text"]["body"].replace("\n", "\n    "))
+        if out["type"] == "document":
+            doc = out["document"]
+            name, pdf, _ = uploads[doc["id"]]
+            marked = "DRAFT watermark" if b"DRAFT" in pdf else "no watermark"
+            print(f"  < (to {out['to']}) [PDF {name}, {len(pdf):,} bytes, {marked}] {doc['caption']}")
+        else:
+            print(f"  < (to {out['to']}) " + out["text"]["body"].replace("\n", "\n    "))
 
 
 def main():
@@ -156,11 +184,20 @@ def main():
         ("STAFF", STAFF, "From now on we give every customer a 20% discount.", text("From now on we give every customer a 20% discount.", "wamid.sim_2")),
         ("STAFF", STAFF, "What deposit do we take on curtain orders?", text("What deposit do we take on curtain orders?", "wamid.sim_3")),
         ("OWNER", OWNER, "Invoice Ali 2,500 AED for blackout curtains", text("Invoice Ali 2,500 AED for blackout curtains", "wamid.sim_4")),
-        ("OWNER", OWNER, "(voice note)", {"id": "wamid.sim_5", "type": "audio", "audio": {"id": "MEDIA_1", "voice": True}}),
+        ("OWNER", OWNER, f"(voice note: \"{VOICE_TRANSCRIPT}\")", {"id": "wamid.sim_5", "type": "audio", "audio": {"id": "MEDIA_1", "voice": True}}),
+        ("STAFF", STAFF, "approve invoice 1001", text("approve invoice 1001", "wamid.sim_7")),
+        ("OWNER", OWNER, "approve invoice 1001", text("approve invoice 1001", "wamid.sim_8")),
+        ("OWNER", OWNER, "Remember: we never work on Fridays", text("Remember: we never work on Fridays", "wamid.sim_9")),
+        ("OWNER", OWNER, "list rules", text("list rules", "wamid.sim_10")),
+        ("OWNER", OWNER, "change rule 1: Deposits are 30% upfront for all curtain orders.", text("change rule 1: Deposits are 30% upfront for all curtain orders.", "wamid.sim_11")),
+        ("OWNER", OWNER, "forget rule 2", text("forget rule 2", "wamid.sim_12")),
+        ("STAFF", STAFF, "list rules", text("list rules", "wamid.sim_13")),
+        ("STAFF", STAFF, "help", text("help", "wamid.sim_14")),
         ("UNKNOWN", STRANGER, "hi, is this the curtain shop?", text("hi, is this the curtain shop?", "wamid.sim_6")),
         ("OWNER", OWNER, "Remember: deposits are 50% upfront for all curtain orders. (Meta re-delivers)", text("Remember: deposits are 50% upfront for all curtain orders.", "wamid.sim_1")),
     ]
-    with patch("litellm.acompletion", fake_ai), patch.object(httpx.AsyncClient, "post", fake_graph_post):
+    with patch("litellm.acompletion", fake_ai), patch.object(httpx.AsyncClient, "post", fake_http_post), \
+            patch.object(httpx.AsyncClient, "get", fake_http_get):
         client = TestClient(app)
         check = client.get("/webhook/whatsapp", params={
             "hub.mode": "subscribe", "hub.verify_token": VERIFY_TOKEN, "hub.challenge": "8675309"})
@@ -173,10 +210,12 @@ def main():
         statuses = conn.execute("SELECT message_sid, status FROM inbound_messages ORDER BY created_at").fetchall()
         usage = conn.execute("SELECT COUNT(*) n, SUM(total_tokens) t, SUM(cost_usd) c FROM token_usage").fetchone()
         invoice = conn.execute("SELECT invoice_number, subtotal, tax_amount, grand_total, status FROM invoices").fetchone()
+        voice_cost = conn.execute("SELECT cost_usd FROM token_usage WHERE model LIKE '%(voice)'").fetchone()
     print("\n--- Stored for Luxe Curtain Interiors ---")
     print("messages:", [tuple(r) for r in statuses])
     print("invoice:", tuple(invoice))
     print(f"AI model: {os.environ['LLM_MODEL']}")
+    print(f"Voice note transcription cost recorded: ${voice_cost['cost_usd']:.6f}")
     print(f"AI usage recorded: {usage['n']} turns, {usage['t']} tokens, ${usage['c']:.6f}")
     shutil.rmtree(WORK_DIR)
 

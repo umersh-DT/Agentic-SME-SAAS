@@ -198,6 +198,50 @@ class TenantMemoryTree:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def list_nodes(self) -> List[Dict[str, Any]]:
+        """All saved rules in the order they were taught (oldest first)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, title, content, category, created_at FROM memory_nodes "
+                "WHERE node_type != 'category' ORDER BY created_at ASC, rowid ASC"
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_node(self, node_id: str) -> bool:
+        """Deletes a rule; its search entry and concepts are removed with it."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys = ON;")
+            cursor = await db.execute("DELETE FROM memory_nodes WHERE id = ?", (node_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def update_node_content(
+        self, node_id: str, content: str, title: str, concepts: Optional[List[str]] = None
+    ) -> bool:
+        """Replaces a rule's text in place (keeps its position) and refreshes its search entry."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys = ON;")
+            cursor = await db.execute(
+                "UPDATE memory_nodes SET content = ?, title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (content, title, node_id),
+            )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                return False
+            await db.execute("DELETE FROM memory_fts WHERE node_id = ?", (node_id,))
+            await db.execute(
+                "INSERT INTO memory_fts(node_id, title, content) VALUES (?, ?, ?)", (node_id, title, content)
+            )
+            await db.execute("DELETE FROM memory_concepts WHERE node_id = ?", (node_id,))
+            for concept in concepts or []:
+                await db.execute(
+                    "INSERT INTO memory_concepts (node_id, concept, relevance_score) VALUES (?, ?, 1.0)",
+                    (node_id, concept.strip().lower()),
+                )
+            await db.commit()
+            return True
+
     async def get_children(self, parent_id: str) -> List[Dict[str, Any]]:
         """Returns all child nodes under a given category or parent node."""
         async with aiosqlite.connect(self.db_path) as db:
