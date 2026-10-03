@@ -20,6 +20,16 @@ class CalendarNotShared(Exception):
     """The business calendar has not been shared with the app's service account."""
 
 
+class CalendarApiDisabled(Exception):
+    """The Google Calendar API is not enabled in the service account's Google Cloud project."""
+
+
+API_DISABLED_MESSAGE = (
+    "The Google Calendar API isn't switched on for the assistant's Google project yet. "
+    "The admin needs to enable \"Google Calendar API\" in Google Cloud Console (APIs & Services → Library)."
+)
+
+
 class SlotUnavailable(Exception):
     """The requested time is in the past, outside business hours, or already taken."""
 
@@ -72,7 +82,11 @@ class GoogleCalendarBooking:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.request(method, url, headers=headers, **kwargs)
         if resp.status_code in (403, 404):
-            logger.warning(f"[CALENDAR] Access denied ({resp.status_code}) for the business calendar.")
+            body = resp.text
+            if any(marker in body for marker in ("accessNotConfigured", "SERVICE_DISABLED", "has not been used in project")):
+                logger.error("[CALENDAR] Google Calendar API is not enabled in the Google Cloud project.")
+                raise CalendarApiDisabled()
+            logger.warning(f"[CALENDAR] Access denied ({resp.status_code}) for the business calendar: {body[:300]}")
             raise CalendarNotShared()
         if resp.status_code >= 400:
             raise RuntimeError(f"Google Calendar error {resp.status_code}: {resp.text[:200]}")
@@ -87,6 +101,7 @@ class GoogleCalendarBooking:
         })
         calendar = (data.get("calendars") or {}).get(self.calendar_id) or {}
         if calendar.get("errors"):
+            logger.warning(f"[CALENDAR] Calendar not reachable (not shared or wrong calendar id): {calendar['errors']}")
             raise CalendarNotShared()
         return [
             (datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(self.tz),

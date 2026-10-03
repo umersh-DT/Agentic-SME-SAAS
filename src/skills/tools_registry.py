@@ -6,7 +6,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.core.storage_models import TenantDatabaseManager
 from src.skills.invoicing import InvoicingSkill, LineItem
-from src.skills.google_calendar import CalendarNotShared, GoogleCalendarBooking, SlotUnavailable, not_shared_message
+from src.skills.google_calendar import (
+    API_DISABLED_MESSAGE,
+    CalendarApiDisabled,
+    CalendarNotShared,
+    GoogleCalendarBooking,
+    SlotUnavailable,
+    not_shared_message,
+)
 from src.skills.memory_tree import TenantMemoryTree
 from src.skills.website_seo import build_seo_report
 
@@ -142,6 +149,8 @@ async def _execute_check_availability(profile: Dict[str, Any], date: str) -> str
         return "Please give the date as YYYY-MM-DD."
     except CalendarNotShared:
         return not_shared_message()
+    except CalendarApiDisabled:
+        return API_DISABLED_MESSAGE
     except Exception as e:
         logger.error(f"[TOOL CALENDAR] availability failed: {e}", exc_info=True)
         return "I couldn't check the calendar right now."
@@ -179,6 +188,8 @@ async def _execute_book_appointment(
         return f"Not booked: {e}"
     except CalendarNotShared:
         return not_shared_message()
+    except CalendarApiDisabled:
+        return API_DISABLED_MESSAGE
     except Exception as e:
         logger.error(f"[TOOL CALENDAR] booking failed: {e}", exc_info=True)
         return "I couldn't book that right now. Nothing was added to the calendar."
@@ -197,6 +208,8 @@ async def _execute_list_appointments(profile: Dict[str, Any], date: str) -> str:
         return "Please give the date as YYYY-MM-DD."
     except CalendarNotShared:
         return not_shared_message()
+    except CalendarApiDisabled:
+        return API_DISABLED_MESSAGE
     except Exception as e:
         logger.error(f"[TOOL CALENDAR] listing failed: {e}", exc_info=True)
         return "I couldn't read the calendar right now."

@@ -155,6 +155,18 @@ class TestCalendarTools(CalendarBase):
         self.assertIn("business hours 10:00-19:00", kwargs["messages"][0]["content"])
         self.assertIn("(Asia/Dubai)", kwargs["messages"][0]["content"])
 
+    async def test_disabled_calendar_api_is_reported_as_such(self):
+        async def disabled(self_client, method, url, **kw):
+            return _resp(403, {"error": {"code": 403, "message": "Google Calendar API has not been used in project "
+                                         "123 before or it is disabled.", "status": "PERMISSION_DENIED",
+                                         "details": [{"reason": "SERVICE_DISABLED"}]}})
+        _, tools = self.tools()
+        with patch.object(httpx.AsyncClient, "request", disabled):
+            reply = await tools["check_availability"](date="2026-10-05")
+        self.assertEqual(reply, "The Google Calendar API isn't switched on for the assistant's Google project yet. "
+                                "The admin needs to enable \"Google Calendar API\" in Google Cloud Console "
+                                "(APIs & Services → Library).")
+
     def test_tenant_settings_are_validated(self):
         with self.assertRaisesRegex(ValueError, "Unknown timezone"):
             TenantConfig(tenant_id="tenant_x", business_name="Xy", timezone="Dubai/Nowhere")
