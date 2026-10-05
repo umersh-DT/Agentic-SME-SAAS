@@ -37,6 +37,13 @@ pricing_per_1m_tokens_by_model:
   "gemini/gemini-2.5-flash-lite":
     prompt_usd: 0.100
     completion_usd: 0.400
+  # "latest" names follow Google's current Flash / Flash-Lite model; rates are estimates, check Google's pricing.
+  "gemini/gemini-flash-latest":
+    prompt_usd: 0.300
+    completion_usd: 2.500
+  "gemini/gemini-flash-lite-latest":
+    prompt_usd: 0.100
+    completion_usd: 0.400
 
 whatsapp:
   # Meta WhatsApp text limit is 4096 characters; longer replies are split.

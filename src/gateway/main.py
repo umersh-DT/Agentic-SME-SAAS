@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import logging
 import os
 import time
+from typing import Optional
 from fastapi import FastAPI, Request, Response
 
 # Show the app's own INFO lines (startup summary, routing, rules) in `docker compose logs`.
@@ -19,10 +20,21 @@ from src.gateway.whatsapp_webhook import (
     tenant_directory,
 )
 from src.gateway.stripe_billing import router as stripe_router
-from src.core.agent_loop import missing_model_api_key, resolve_model_name
+from src.core.agent_loop import missing_model_api_key, model_unavailable_reason, resolve_model_name
+from src.utils.alerts import send_platform_alert
 from src.core.storage_models import load_default_settings
 
 logger = logging.getLogger("gateway_main")
+
+
+async def check_ai_model(model_name: str) -> Optional[str]:
+    problem = await model_unavailable_reason(model_name)
+    if problem:
+        logger.critical(f"[STARTUP AI MODEL] {problem}")
+        await send_platform_alert("[Assistant] AI model not working", problem)
+    else:
+        logger.info(f"[STARTUP] AI model {model_name} answered a test request.")
+    return problem
 
 
 @asynccontextmanager
@@ -37,6 +49,8 @@ async def lifespan(app: FastAPI):
         logger.critical(f"[STARTUP FATAL] {message}")
         raise RuntimeError(message)
     logger.info(f"[STARTUP] AI model: {model_name}")
+    # Test the model in the background so a retired name or bad key shows up at once (log + email).
+    app.state.model_check = asyncio.create_task(check_ai_model(model_name))
     logger.info(
         f"[STARTUP] Business list {os.environ.get('TENANTS_CONFIG_PATH', 'config/tenants.yaml')}: "
         f"{len(tenant_directory.tenants)} businesses, {len(tenant_directory.phone_to_tenant)} phone numbers"

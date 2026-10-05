@@ -51,6 +51,31 @@ def resolve_pricing(settings: Dict[str, Any], model_name: str) -> Tuple[float, f
     return float(rates.get("prompt_usd", 0.150)), float(rates.get("completion_usd", 0.600))
 
 
+async def model_unavailable_reason(model_name: str) -> Optional[str]:
+    """Sends a one-token test request; returns why the model can't be used, or None if it answers.
+
+    A usage-limit reply still proves the model exists, so it counts as available.
+    """
+    if litellm is None:
+        return "litellm is not installed."
+    try:
+        await asyncio.wait_for(
+            litellm.acompletion(model=model_name, messages=[{"role": "user", "content": "ping"}], max_tokens=1),
+            timeout=20,
+        )
+        return None
+    except litellm.RateLimitError:
+        return None
+    except litellm.NotFoundError:
+        return (f"Google/OpenAI says the AI model '{model_name}' does not exist or is retired. "
+                "Set LLM_MODEL in .env to a current model (e.g. gemini/gemini-flash-lite-latest) and run up -d.")
+    except litellm.AuthenticationError:
+        return f"The API key for AI model '{model_name}' was rejected. Put a valid key in .env and run up -d."
+    except Exception as e:
+        logger.warning(f"[STARTUP] Could not test AI model '{model_name}' (will try on first message): {e}")
+        return None
+
+
 def missing_model_api_key(model_name: str) -> Optional[str]:
     """Name of the API key variable the model needs but is not set, or None if it is set."""
     key_env = PROVIDER_KEY_ENV.get(model_name.split("/", 1)[0])
