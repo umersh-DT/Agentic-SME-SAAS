@@ -3,7 +3,8 @@
 #
 # Repository secrets needed for the update step (Settings > Secrets and variables > Actions):
 #   DEPLOY_HOST         server IP, e.g. 167.233.67.253
-#   DEPLOY_SSH_KEY      private deploy key (its public half is restricted to scripts/deploy.sh on the server)
+#   DEPLOY_SSH_KEY      private deploy key, as printed by `cat ~/.ssh/github_deploy` or as one line from
+#                       `base64 -w0 ~/.ssh/github_deploy` (its public half only runs scripts/deploy.sh)
 #   DEPLOY_KNOWN_HOSTS  the server's host key fingerprint, e.g. SHA256:abc... from
 #                       `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` (or a full known_hosts line),
 #                       so GitHub only talks to your server
@@ -52,7 +53,23 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           # Secrets pasted from a Windows terminal can carry hidden \r characters; strip them.
           host="$(printf '%s' "$DEPLOY_HOST" | tr -d '[:space:]')"
-          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          # Rebuild the private key from its base64 body so copy damage (trailing spaces, line breaks
+          # turned into spaces, missing final newline) doesn't matter; also accepts a base64 -w0 copy.
+          raw="$(printf '%s' "$DEPLOY_SSH_KEY" | tr -d '\r')"
+          if ! printf '%s' "$raw" | grep -q 'BEGIN OPENSSH PRIVATE KEY'; then
+            raw="$(printf '%s' "$raw" | tr -d '[:space:]' | base64 -d 2>/dev/null || true)"
+          fi
+          body="$(printf '%s' "$raw" | sed -e 's/-----BEGIN OPENSSH PRIVATE KEY-----//' \
+                                           -e 's/-----END OPENSSH PRIVATE KEY-----//' | tr -d '[:space:]')"
+          { echo "-----BEGIN OPENSSH PRIVATE KEY-----"; printf '%s\n' "$body" | fold -w 70; \
+            echo "-----END OPENSSH PRIVATE KEY-----"; } > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null 2>&1; then
+            echo "DEPLOY_SSH_KEY is not a complete private key. On the server run: base64 -w0 ~/.ssh/github_deploy"
+            echo "and paste that single line as the DEPLOY_SSH_KEY secret."
+            exit 1
+          fi
+          echo "Deploy key loaded: $(ssh-keygen -lf ~/.ssh/deploy_key | awk '{print $2}')"
           expected="$(printf '%s' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r')"
 
           ssh-keyscan -t ed25519 "$host" 2>/dev/null > ~/.ssh/scanned || true
