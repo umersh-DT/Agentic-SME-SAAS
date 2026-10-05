@@ -107,5 +107,32 @@ class TestRateLimits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spend, 0.0)
 
 
+class TestStartupModelCheck(unittest.IsolatedAsyncioTestCase):
+    async def _check(self, side_effect):
+        from src.gateway.main import check_ai_model
+        with patch("litellm.acompletion", AsyncMock(side_effect=side_effect)) as mock_llm, \
+             patch("src.gateway.main.send_platform_alert", AsyncMock(return_value={"email": True})) as alert:
+            problem = await check_ai_model("gemini/gemini-2.5-flash-lite")
+        return problem, mock_llm, alert
+
+    async def test_retired_model_is_reported_and_emailed(self):
+        not_found = litellm.NotFoundError(message="404 models/gemini-2.5-flash-lite is not found",
+                                          llm_provider="gemini", model="gemini-2.5-flash-lite")
+        problem, mock_llm, alert = await self._check(not_found)
+        self.assertEqual(problem, "Google/OpenAI says the AI model 'gemini/gemini-2.5-flash-lite' does not exist or "
+                                  "is retired. Set LLM_MODEL in .env to a current model (e.g. "
+                                  "gemini/gemini-flash-lite-latest) and run up -d.")
+        self.assertEqual(mock_llm.call_args.kwargs["max_tokens"], 1)
+        alert.assert_awaited_once_with("[Assistant] AI model not working", problem)
+
+    async def test_working_or_rate_limited_model_is_fine(self):
+        ok = SimpleNamespace(choices=[], usage=None)
+        rate_limited = litellm.RateLimitError(message="429", llm_provider="gemini", model="x")
+        for outcome in (ok, rate_limited):
+            problem, _, alert = await self._check([outcome] if outcome is ok else rate_limited)
+            self.assertIsNone(problem)
+            alert.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()
