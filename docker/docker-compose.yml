@@ -43,6 +43,8 @@ services:
       # Optional: higher quota for Google's free website check (works without a key at low volume).
       - PAGESPEED_API_KEY=${PAGESPEED_API_KEY:-}
       # Google Calendar / Search Console use the service account key at config/google-service-account.json
+      # WhatsApp numbers allowed to add/remove businesses by message (comma-separated).
+      - PLATFORM_ADMIN_PHONES=${PLATFORM_ADMIN_PHONES:-}
       # Optional second alert channel (WhatsApp) in addition to email.
       - PLATFORM_ALERT_WHATSAPP=${PLATFORM_ALERT_WHATSAPP:-}
       # Business list file inside config/. Use tenants.local.yaml for real numbers (kept out of git).

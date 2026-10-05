@@ -11,6 +11,7 @@ import yaml
 
 from src.core.storage_models import TenantDatabaseManager, load_default_settings
 from src.gateway.dispatcher import TenantWorkerDispatcher
+from src.gateway.platform_admin import handle_admin_command, is_admin_command, is_platform_admin
 from src.skills.whatsapp_reply import WhatsAppReplySkill
 from src.utils.security import TenantConfig, describe_error_safely, mask_phone_number, normalize_phone_number
 
@@ -219,6 +220,12 @@ async def verify_whatsapp_webhook(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed.")
 
 
+async def _run_admin_command(from_number: str, text: str) -> None:
+    logger.info(f"[ADMIN] Command from {mask_phone_number(from_number)}")
+    reply = await handle_admin_command(text, tenant_directory)
+    await reply_skill.send_reply(to_number=from_number, message=reply)
+
+
 async def _handle_inbound_message(message: Dict[str, Any], background_tasks: BackgroundTasks) -> str:
     """Routes one inbound message. Returns what happened (for logs and tests)."""
     message_id = str(message.get("id", ""))
@@ -232,7 +239,14 @@ async def _handle_inbound_message(message: Dict[str, Any], background_tasks: Bac
         logger.warning(f"[DEDUP] Dropping duplicate WhatsApp message id={message_id}")
         return "duplicate"
 
-    # 2. Strict sender resolution
+    # 2. Platform admin commands (manage businesses from WhatsApp; no restart, no SSH)
+    if msg_type == "text":
+        text_body = ((message.get("text") or {}).get("body") or "").strip()
+        if is_platform_admin(from_number) and is_admin_command(text_body):
+            background_tasks.add_task(_run_admin_command, from_number, text_body)
+            return "admin_command"
+
+    # 3. Strict sender resolution
     tenant_id = tenant_directory.resolve_sender(from_number)
     if not tenant_id:
         logger.warning(f"[ROUTING REJECT] Unregistered sender: {mask_phone_number(from_number)}.")

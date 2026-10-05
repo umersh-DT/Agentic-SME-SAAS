@@ -168,6 +168,26 @@ Per business (owner + operator):
   a user in Google Search Console, and the operator sets `search_console_property`
   (e.g. `sc-domain:example.com`).
 
+### Managing businesses from WhatsApp (platform admin)
+Set `PLATFORM_ADMIN_PHONES=+9715…` (comma-separated) in `.env` and `TENANTS_FILE=tenants.local.yaml`, and let the
+app write the business list once: `chown -R 1000:1000 config`. Then from an admin number send `admin help`,
+`list businesses`, `add business Ali Cleaning owner +9715…`, `add staff +9715… to Ali Cleaning`,
+`set calendar owner@gmail.com for Ali Cleaning`, `remove business Ali Cleaning` … Changes apply immediately,
+no restart. Removing a business keeps its saved data.
+
+### Automatic updates
+Every pull request runs the tests on GitHub. When a change reaches `main`, GitHub runs the tests and then
+`scripts/deploy.sh` on the server: fast-forward to the new code, rebuild, health check; if the check fails it
+returns to the previous version and emails `ALERT_EMAIL`. One-time setup on the server:
+```bash
+ssh-keygen -t ed25519 -N "" -C github-deploy -f ~/.ssh/github_deploy
+echo "command=\"/root/Agentic-SME-SAAS/scripts/deploy.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $(cat ~/.ssh/github_deploy.pub)" >> ~/.ssh/authorized_keys
+cat ~/.ssh/github_deploy          # -> GitHub secret DEPLOY_SSH_KEY
+ssh-keyscan -t ed25519 <server IP> # -> GitHub secret DEPLOY_KNOWN_HOSTS
+```
+and add `DEPLOY_HOST=<server IP>` as a third secret (GitHub → Settings → Secrets and variables → Actions).
+The key can only run the update script. Manual update any time: `./scripts/deploy.sh`.
+
 ---
 
 ## 5. Backups

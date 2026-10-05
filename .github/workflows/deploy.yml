@@ -1,0 +1,54 @@
+# Runs the tests on every pull request and push. After a push to main (e.g. merging a pull
+# request) passes the tests, it updates the server through scripts/deploy.sh.
+#
+# Repository secrets needed for the update step (Settings > Secrets and variables > Actions):
+#   DEPLOY_HOST         server IP, e.g. 167.233.67.253
+#   DEPLOY_SSH_KEY      private deploy key (its public half is restricted to scripts/deploy.sh on the server)
+#   DEPLOY_KNOWN_HOSTS  output of `ssh-keyscan <server IP>`, so GitHub only talks to your server
+name: Test and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run tests
+        env:
+          LOG_LEVEL: WARNING
+        run: python -m unittest discover -s tests -t .
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update the server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_SSH_KEY" ] || [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "Deploy secrets are not set yet; skipping the server update."
+            exit 0
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The server runs scripts/deploy.sh for this key whatever command is sent.
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "root@$DEPLOY_HOST" deploy
