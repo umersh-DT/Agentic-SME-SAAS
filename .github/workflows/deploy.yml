@@ -4,7 +4,9 @@
 # Repository secrets needed for the update step (Settings > Secrets and variables > Actions):
 #   DEPLOY_HOST         server IP, e.g. 167.233.67.253
 #   DEPLOY_SSH_KEY      private deploy key (its public half is restricted to scripts/deploy.sh on the server)
-#   DEPLOY_KNOWN_HOSTS  output of `ssh-keyscan <server IP>`, so GitHub only talks to your server
+#   DEPLOY_KNOWN_HOSTS  the server's host key fingerprint, e.g. SHA256:abc... from
+#                       `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` (or a full known_hosts line),
+#                       so GitHub only talks to your server
 name: Test and deploy
 
 on:
@@ -48,7 +50,27 @@ jobs:
             exit 0
           fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          # The server runs scripts/deploy.sh for this key whatever command is sent.
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "root@$DEPLOY_HOST" deploy
+          # Secrets pasted from a Windows terminal can carry hidden \r characters; strip them.
+          host="$(printf '%s' "$DEPLOY_HOST" | tr -d '[:space:]')"
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          expected="$(printf '%s' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r')"
+
+          ssh-keyscan -t ed25519 "$host" 2>/dev/null > ~/.ssh/scanned || true
+          presented="$(ssh-keygen -lf ~/.ssh/scanned 2>/dev/null | awk '{print $2}')"
+          echo "Server presents host key fingerprint: ${presented:-<none>}"
+
+          if printf '%s' "$expected" | grep -q 'SHA256:'; then
+            # Fingerprint mode: trust the scanned key only if it matches the saved fingerprint exactly.
+            wanted="$(printf '%s' "$expected" | grep -o 'SHA256:[A-Za-z0-9+/=]*' | head -n 1)"
+            echo "GitHub expects host key fingerprint: $wanted"
+            if [ -z "$presented" ] || [ "$presented" != "$wanted" ]; then
+              echo "Host key fingerprint does not match; refusing to connect."
+              exit 1
+            fi
+            cp ~/.ssh/scanned ~/.ssh/known_hosts
+          else
+            # Full known_hosts line(s) mode.
+            printf '%s\n' "$expected" | grep -v '^#' > ~/.ssh/known_hosts
+            echo "GitHub expects host key fingerprint(s): $(ssh-keygen -lf ~/.ssh/known_hosts 2>&1 | awk '{print $2}' | tr '\n' ' ')"
+          fi
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "root@$host" deploy

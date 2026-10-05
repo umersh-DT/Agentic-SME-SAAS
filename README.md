@@ -183,7 +183,7 @@ returns to the previous version and emails `ALERT_EMAIL`. One-time setup on the 
 ssh-keygen -t ed25519 -N "" -C github-deploy -f ~/.ssh/github_deploy
 echo "command=\"/root/Agentic-SME-SAAS/scripts/deploy.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $(cat ~/.ssh/github_deploy.pub)" >> ~/.ssh/authorized_keys
 cat ~/.ssh/github_deploy          # -> GitHub secret DEPLOY_SSH_KEY
-ssh-keyscan -t ed25519 <server IP> # -> GitHub secret DEPLOY_KNOWN_HOSTS
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}'   # SHA256:... -> GitHub secret DEPLOY_KNOWN_HOSTS
 ```
 and add `DEPLOY_HOST=<server IP>` as a third secret (GitHub → Settings → Secrets and variables → Actions).
 The key can only run the update script. Manual update any time: `./scripts/deploy.sh`.
