@@ -19,9 +19,10 @@ def load_default_settings(config_path: str = "config/default_settings.yaml") -> 
             return yaml.safe_load(f) or {}
     return {
         "llm": {"model": "openai/gpt-4o-mini", "timeout_seconds": 25, "max_tokens": 800, "max_tool_rounds": 4},
+        "quotas": {"enforce": False},
         "quotas_usd_monthly": {"starter": 5.00, "pro": 20.00, "enterprise": 100.00},
         "pricing_per_1m_tokens": {"prompt_usd": 0.150, "completion_usd": 0.600},
-        "whatsapp": {"max_message_chars": 1550, "history_limit": 10},
+        "whatsapp": {"max_message_chars": 4096, "history_limit": 10},
     }
 
 
@@ -58,6 +59,11 @@ class TenantDatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Schema migration: media id lets voice notes be re-processed after a crash
+            cursor.execute("PRAGMA table_info(inbound_messages);")
+            if "media_id" not in [col[1] for col in cursor.fetchall()]:
+                cursor.execute("ALTER TABLE inbound_messages ADD COLUMN media_id TEXT;")
 
             # 2. Rolling conversation history table (per-tenant/sender session buffer)
             cursor.execute("""
@@ -109,6 +115,13 @@ class TenantDatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_invoices_created 
                 ON invoices(created_at);
             """)
+            # Schema migration: line description (for the PDF) and approval time
+            cursor.execute("PRAGMA table_info(invoices);")
+            invoice_columns = [col[1] for col in cursor.fetchall()]
+            if "description" not in invoice_columns:
+                cursor.execute("ALTER TABLE invoices ADD COLUMN description TEXT;")
+            if "approved_at" not in invoice_columns:
+                cursor.execute("ALTER TABLE invoices ADD COLUMN approved_at TIMESTAMP;")
 
             # 4. Token & monthly USD cost metering table
             cursor.execute("""
@@ -151,14 +164,15 @@ class TenantDatabaseManager:
         from_number: str,
         body: str,
         num_media: int = 0,
+        media_id: Optional[str] = None,
     ) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO inbound_messages (message_sid, from_number, body, num_media, status)
-                VALUES (?, ?, ?, ?, 'pending');
+                INSERT OR IGNORE INTO inbound_messages (message_sid, from_number, body, num_media, media_id, status)
+                VALUES (?, ?, ?, ?, ?, 'pending');
                 """,
-                (message_sid, from_number, body, num_media),
+                (message_sid, from_number, body, num_media, media_id),
             )
             conn.commit()
 
@@ -168,9 +182,35 @@ class TenantDatabaseManager:
         from_number: str,
         body: str,
         num_media: int = 0,
+        media_id: Optional[str] = None,
     ) -> None:
-        """Persists message before acknowledging Twilio webhook."""
-        await asyncio.to_thread(self._sync_persist_inbound_message, message_sid, from_number, body, num_media)
+        """Persists message before acknowledging the WhatsApp webhook."""
+        await asyncio.to_thread(
+            self._sync_persist_inbound_message, message_sid, from_number, body, num_media, media_id
+        )
+
+    def _sync_get_message_status(self, message_sid: str) -> Optional[str]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM inbound_messages WHERE message_sid = ?;", (message_sid,)
+            ).fetchone()
+            return str(row["status"]) if row else None
+
+    async def get_message_status(self, message_sid: str) -> Optional[str]:
+        """Current processing status of an inbound message, or None if unknown."""
+        return await asyncio.to_thread(self._sync_get_message_status, message_sid)
+
+    def _sync_set_message_body(self, message_sid: str, body: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE inbound_messages SET body = ?, updated_at = CURRENT_TIMESTAMP WHERE message_sid = ?;",
+                (body, message_sid),
+            )
+            conn.commit()
+
+    async def set_message_body(self, message_sid: str, body: str) -> None:
+        """Stores the text of a message (e.g. a voice note transcript)."""
+        await asyncio.to_thread(self._sync_set_message_body, message_sid, body)
 
     def _sync_update_message_status(self, message_sid: str, status: str) -> None:
         with self._get_connection() as conn:
@@ -293,8 +333,8 @@ class TenantDatabaseManager:
                     invoice_number, tenant_id, client_name, client_contact,
                     currency, subtotal, tax_amount, grand_total,
                     deposit_percentage, required_deposit, balance_due,
-                    status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    status, notes, description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     draft["invoice_number"],
@@ -310,6 +350,7 @@ class TenantDatabaseManager:
                     float(draft.get("balance_due", 0.0)),
                     draft.get("status", "draft"),
                     draft.get("notes"),
+                    draft.get("description"),
                 ),
             )
             conn.commit()
@@ -328,6 +369,36 @@ class TenantDatabaseManager:
     async def get_invoice(self, invoice_number: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single invoice by invoice number."""
         return await asyncio.to_thread(self._sync_get_invoice, invoice_number)
+
+    def _sync_find_invoice(self, reference: str) -> Optional[Dict[str, Any]]:
+        ref = reference.strip().upper()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if ref.isdigit():
+                # "1001" -> the most recent invoice whose number ends in -1001
+                cursor.execute(
+                    "SELECT * FROM invoices WHERE invoice_number LIKE ? ORDER BY created_at DESC LIMIT 1;",
+                    (f"%-{ref}",),
+                )
+            else:
+                cursor.execute("SELECT * FROM invoices WHERE UPPER(invoice_number) = ?;", (ref,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    async def find_invoice(self, reference: str) -> Optional[Dict[str, Any]]:
+        """Finds an invoice by full number (INV-...-1001) or by its sequence number (1001)."""
+        return await asyncio.to_thread(self._sync_find_invoice, reference)
+
+    def _sync_approve_invoice(self, invoice_number: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE invoices SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE invoice_number = ?;",
+                (invoice_number,),
+            )
+            conn.commit()
+
+    async def approve_invoice(self, invoice_number: str) -> None:
+        await asyncio.to_thread(self._sync_approve_invoice, invoice_number)
 
     # --- Token Metering & USD Cost Cap Enforcement ---
 
@@ -394,6 +465,27 @@ class TenantDatabaseManager:
             completion_tokens,
             prompt_rate_per_1m,
             completion_rate_per_1m,
+        )
+
+    def _sync_record_usage_cost(
+        self, message_sid: str, model: str, cost_usd: float, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO token_usage (message_sid, model, prompt_tokens, completion_tokens, total_tokens, cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (message_sid, model, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost_usd),
+            )
+            conn.commit()
+
+    async def record_usage_cost(
+        self, message_sid: str, model: str, cost_usd: float, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """Records a precomputed cost (e.g. voice transcription billed per minute or per audio token)."""
+        await asyncio.to_thread(
+            self._sync_record_usage_cost, message_sid, model, cost_usd, prompt_tokens, completion_tokens
         )
 
     async def check_quota_exceeded(self, plan_tier: str, settings: Dict[str, Any]) -> Tuple[bool, float, float]:

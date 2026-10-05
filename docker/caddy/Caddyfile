@@ -1,0 +1,11 @@
+# Caddy obtains and renews the HTTPS certificate for $DOMAIN automatically (Let's Encrypt).
+# Certificates are stored in the caddy_data volume so they survive restarts.
+{$DOMAIN} {
+	encode gzip
+
+	# Internal endpoints are never served to the internet.
+	@internal path /metrics /metrics/* /docs /docs/* /redoc /openapi.json
+	respond @internal "Not found" 404
+
+	reverse_proxy gateway:8000
+}
